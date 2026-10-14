@@ -15,6 +15,20 @@ delete_stack() {
   ok "已删除 $stack"
 }
 
+# GPU 实例终止常超过 10 分钟 (CLI waiter 的默认上限)，这里自行轮询，最长 30 分钟
+wait_terminated() {
+  local start left
+  start="$(date +%s)"
+  log "等待实例终止: $* (GPU 实例通常需要 5-15 分钟)"
+  while true; do
+    left="$(aws ec2 describe-instances --instance-ids "$@" \
+      --query "Reservations[].Instances[?State.Name!='terminated'].InstanceId" --output text)"
+    [[ -z "$left" ]] && return 0
+    (( $(date +%s) - start < 1800 )) || die "等待超时，仍未终止: $left (稍后重新执行 ./destroy.sh)"
+    sleep 20
+  done
+}
+
 main() {
   parse_common_flags "$@"
   load_config
@@ -23,7 +37,7 @@ main() {
   local ids bucket="" secret=""
   ids="$(aws ec2 describe-instances \
     --filters "Name=tag:Project,Values=$PROJECT_NAME" "Name=tag:Role,Values=vllm" \
-              "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+              "Name=instance-state-name,Values=pending,running,stopping,stopped,shutting-down" \
     --query 'Reservations[].Instances[].InstanceId' --output text)"
   [[ "$(stack_status "$INFERENCE_STACK")" != "NOT_FOUND" ]] && \
     { bucket="$(stack_output "$INFERENCE_STACK" ModelBucketName 2>/dev/null || true)"
@@ -40,9 +54,8 @@ EOF
   if [[ -n "$ids" ]]; then
     # shellcheck disable=SC2086
     aws ec2 terminate-instances --instance-ids $ids >/dev/null
-    log "等待实例终止: $ids"
-    # shellcheck disable=SC2086
-    aws ec2 wait instance-terminated --instance-ids $ids
+    # shellcheck disable=SC2086  # 需要按空格拆分为多个实例 ID
+    wait_terminated $ids
     ok "实例已终止"
   fi
   delete_stack "$INFERENCE_STACK"
