@@ -1,0 +1,343 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  GPU-on-EC2 运维跳板机: public subnet + EIP，支持 SSH (来源白名单) 与 SSM；
+  可 SSH / SSM 访问 GPU 实例、直连 vLLM 8000 端口，读写模型 bucket 及额外指定的 bucket。
+
+Parameters:
+  ProjectName:
+    Type: String
+    AllowedPattern: "^[a-z][a-z0-9-]{1,20}$"
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PublicSubnetId:
+    Type: AWS::EC2::Subnet::Id
+  GpuInstanceSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+  InstanceType:
+    Type: String
+    Default: t3.small
+  RootVolumeGB:
+    Type: Number
+    Default: 50
+    MinValue: 30
+  ImageId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+  OpsBucketArns:
+    Type: CommaDelimitedList
+    Description: 跳板机可访问的 bucket ARN 列表
+  OpsObjectArns:
+    Type: CommaDelimitedList
+    Description: 对应的对象 ARN 列表 (arn:...:bucket/*)
+  ModelBucketName:
+    Type: String
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+  ApiKeySecretArn:
+    Type: String
+    AllowedPattern: "^arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+$"
+  LogGroupName:
+    Type: String
+    AllowedPattern: "^[A-Za-z0-9/_.#-]+$"
+  SshCidr1:
+    Type: String
+    Description: 允许 SSH 登录跳板机的来源 CIDR (SshCidr1-5，至少填写 1 个)
+    AllowedPattern: "^(\\d{1,3}\\.){3}\\d{1,3}/\\d{1,2}$"
+  SshCidr2:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^(\\d{1,3}\\.){3}\\d{1,3}/\\d{1,2}$"
+  SshCidr3:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^(\\d{1,3}\\.){3}\\d{1,3}/\\d{1,2}$"
+  SshCidr4:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^(\\d{1,3}\\.){3}\\d{1,3}/\\d{1,2}$"
+  SshCidr5:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^(\\d{1,3}\\.){3}\\d{1,3}/\\d{1,2}$"
+
+Conditions:
+  HasSshCidr2: !Not [!Equals [!Ref SshCidr2, ""]]
+  HasSshCidr3: !Not [!Equals [!Ref SshCidr3, ""]]
+  HasSshCidr4: !Not [!Equals [!Ref SshCidr4, ""]]
+  HasSshCidr5: !Not [!Equals [!Ref SshCidr5, ""]]
+
+Resources:
+  BastionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${ProjectName} ops bastion - SSH from allowed CIDRs"
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: ops tooling (dnf / pip / AWS APIs / GPU instances)
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-bastion-sg" }
+
+  BastionSshIngress1:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref BastionSecurityGroup
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      CidrIp: !Ref SshCidr1
+      Description: ops SSH
+
+  BastionSshIngress2:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasSshCidr2
+    Properties:
+      GroupId: !Ref BastionSecurityGroup
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      CidrIp: !Ref SshCidr2
+      Description: ops SSH
+
+  BastionSshIngress3:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasSshCidr3
+    Properties:
+      GroupId: !Ref BastionSecurityGroup
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      CidrIp: !Ref SshCidr3
+      Description: ops SSH
+
+  BastionSshIngress4:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasSshCidr4
+    Properties:
+      GroupId: !Ref BastionSecurityGroup
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      CidrIp: !Ref SshCidr4
+      Description: ops SSH
+
+  BastionSshIngress5:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasSshCidr5
+    Properties:
+      GroupId: !Ref BastionSecurityGroup
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      CidrIp: !Ref SshCidr5
+      Description: ops SSH
+
+  # 跳板机 -> GPU 实例: SSH 与 vLLM 端口 (规则随本栈删除)
+  GpuSshFromBastion:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref GpuInstanceSecurityGroupId
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      SourceSecurityGroupId: !Ref BastionSecurityGroup
+      Description: SSH from ops bastion
+
+  GpuVllmFromBastion:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref GpuInstanceSecurityGroupId
+      IpProtocol: tcp
+      FromPort: 8000
+      ToPort: 8000
+      SourceSecurityGroupId: !Ref BastionSecurityGroup
+      Description: vLLM API from ops bastion
+
+  BastionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-bastion-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: !Sub "ec2.${AWS::URLSuffix}" }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
+      Policies:
+        - PolicyName: ops
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ListOpsBuckets
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:ListBucketVersions
+                  - s3:GetBucketLocation
+                Resource: !Ref OpsBucketArns
+              - Sid: ReadWriteOpsObjects
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:AbortMultipartUpload
+                  - s3:ListMultipartUploadParts
+                Resource: !Ref OpsObjectArns
+              - Sid: ReadApiKey
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref ApiKeySecretArn
+              - Sid: ReadVllmLogs
+                Effect: Allow
+                Action:
+                  - logs:FilterLogEvents
+                  - logs:GetLogEvents
+                  - logs:DescribeLogStreams
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${LogGroupName}"
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${LogGroupName}:*"
+              - Sid: DescribeForOps
+                Effect: Allow
+                # Describe 类 API 不支持资源级权限，只读
+                Action:
+                  - ec2:DescribeInstances
+                  - elasticloadbalancing:DescribeTargetHealth
+                  - elasticloadbalancing:DescribeTargetGroups
+                Resource: "*"
+              - Sid: SsmToProjectGpuInstances
+                Effect: Allow
+                Action: ssm:StartSession
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/Project: !Ref ProjectName
+              - Sid: SsmSessionDocuments
+                Effect: Allow
+                Action: ssm:StartSession
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:document/SSM-SessionManagerRunShell"
+                  - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}::document/AWS-StartSSHSession"
+                  - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}::document/AWS-StartPortForwardingSession"
+              # 注: 未限制为"自身会话"; 跳板机为受控运维机，按 session/* 授权
+              - Sid: ManageOwnSsmSessions
+                Effect: Allow
+                Action:
+                  - ssm:TerminateSession
+                  - ssm:ResumeSession
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:session/*"
+
+  BastionInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${ProjectName}-bastion-${AWS::Region}"
+      Roles: [!Ref BastionRole]
+
+  BastionLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${ProjectName}-bastion"
+      LaunchTemplateData:
+        ImageId: !Ref ImageId
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyName
+        IamInstanceProfile:
+          Arn: !GetAtt BastionInstanceProfile.Arn
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 1
+          HttpEndpoint: enabled
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            SubnetId: !Ref PublicSubnetId
+            Groups: [!Ref BastionSecurityGroup]
+            # 启动时先有临时公网 IP 保证 user-data 可联网，随后由 EIP 替换
+            AssociatePublicIpAddress: true
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: !Ref RootVolumeGB
+              VolumeType: gp3
+              Encrypted: true
+              DeleteOnTermination: true
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - { Key: Name, Value: !Sub "${ProjectName}-bastion" }
+              - { Key: Project, Value: !Ref ProjectName }
+              - { Key: Role, Value: bastion }
+          - ResourceType: volume
+            Tags:
+              - { Key: Name, Value: !Sub "${ProjectName}-bastion-root" }
+              - { Key: Project, Value: !Ref ProjectName }
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -uo pipefail
+            exec > >(tee -a /var/log/bastion-userdata.log) 2>&1
+            for i in 1 2 3 4 5 6 7 8 9 10; do
+              dnf install -y -q jq tmux && break
+              echo "dnf 重试 $i"; sleep 10
+            done
+            rpm -q session-manager-plugin >/dev/null 2>&1 || \
+              dnf install -y -q https://s3.amazonaws.com/session-manager-downloads/plugin/latest/linux_64bit/session-manager-plugin.rpm
+            cat >/etc/profile.d/llm-ops.sh <<'__ENV__'
+            export AWS_REGION='${AWS::Region}'
+            export AWS_DEFAULT_REGION='${AWS::Region}'
+            export LLM_PROJECT='${ProjectName}'
+            export MODEL_BUCKET='${ModelBucketName}'
+            export API_KEY_SECRET_ARN='${ApiKeySecretArn}'
+            export VLLM_LOG_GROUP='${LogGroupName}' 
+            __ENV__
+            cat >/usr/local/bin/gpu-list <<'__SCRIPT__'
+            #!/bin/bash
+            # 列出本项目的 GPU 实例 (登录: ssh ec2-user@<PrivateIp>  或  aws ssm start-session --target <InstanceId>)
+            aws ec2 describe-instances \
+              --filters "Name=tag:Project,Values=$LLM_PROJECT" "Name=tag:Role,Values=vllm" \
+                        "Name=instance-state-name,Values=pending,running" \
+              --query 'Reservations[].Instances[].[InstanceId,InstanceType,Placement.AvailabilityZone,PrivateIpAddress,KeyName,State.Name]' \
+              --output table
+            __SCRIPT__
+            cat >/usr/local/bin/vllm-key <<'__SCRIPT__'
+            #!/bin/bash
+            # 输出 vLLM API Key，例如: curl -H "Authorization: Bearer $(vllm-key)" http://<PrivateIp>:8000/v1/models
+            aws secretsmanager get-secret-value --secret-id "$API_KEY_SECRET_ARN" --query SecretString --output text
+            __SCRIPT__
+            chmod 755 /usr/local/bin/gpu-list /usr/local/bin/vllm-key
+            if command -v jq >/dev/null && session-manager-plugin --version >/dev/null 2>&1; then
+              echo "bastion ready"
+            else
+              echo "ERROR: jq / session-manager-plugin 安装失败，请查看 /var/log/bastion-userdata.log"
+              exit 1
+            fi
+
+  BastionInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref BastionLaunchTemplate
+        Version: !GetAtt BastionLaunchTemplate.LatestVersionNumber
+
+  BastionEip:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref BastionInstance
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-bastion" }
+        - { Key: Project, Value: !Ref ProjectName }
+
+Outputs:
+  BastionInstanceId:
+    Value: !Ref BastionInstance
+  BastionPublicIp:
+    Value: !Ref BastionEip
+  BastionSecurityGroupId:
+    Value: !Ref BastionSecurityGroup
+  KeyName:
+    Value: !Ref KeyName

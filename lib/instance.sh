@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2153  # OPS_KEY_NAME 等变量由 load_config 设置
 # GPU 实例: user-data 渲染、跨 AZ/机型容量回退创建、注册 NLB、健康等待
 
 INSTANCE_ROLE_TAG="vllm"
@@ -86,6 +87,7 @@ try_run_instance() {
       "ResourceType=volume,Tags=[{Key=Name,Value=$PROJECT_NAME-vllm-root},{Key=Project,Value=$PROJECT_NAME}]"
     --count 1 --query 'Instances[0].InstanceId' --output text
   )
+  [[ -n "${GPU_KEY_NAME:-}" ]] && args+=(--key-name "$GPU_KEY_NAME")
   [[ -n "$CAPACITY_RESERVATION_ID" ]] && \
     args+=(--capacity-reservation-specification "CapacityReservationTarget={CapacityReservationId=$CAPACITY_RESERVATION_ID}")
   local attempt
@@ -113,6 +115,12 @@ launch_with_fallback() {
   USER_DATA_FILE="$(mktemp)"
   trap 'rm -f "$USER_DATA_FILE"' EXIT
   render_user_data "$USER_DATA_FILE"
+  GPU_KEY_NAME="$(gpu_key_name)"
+  if [[ -n "$GPU_KEY_NAME" ]]; then
+    log "GPU 实例挂载 SSH key: $GPU_KEY_NAME (可经跳板机 ssh -J 登录)"
+  else
+    log "未找到运维 key pair $OPS_KEY_NAME，GPU 实例不挂 SSH key (可用 SSM 登录; 先运行 ./deploy-bastion.sh 可启用 SSH)"
+  fi
   local udfile="$USER_DATA_FILE"
 
   local types=("$INSTANCE_TYPE") t round sid az rc

@@ -38,6 +38,8 @@ load_config() {
   export AWS_REGION AWS_DEFAULT_REGION="$AWS_REGION"
   NETWORK_STACK="${PROJECT_NAME}-network"
   INFERENCE_STACK="${PROJECT_NAME}-inference"
+  BASTION_STACK="${PROJECT_NAME}-bastion"
+  OPS_KEY_NAME="${KEY_NAME:-${PROJECT_NAME}-ops}"
 }
 
 validate_config() {
@@ -62,6 +64,15 @@ validate_config() {
   local t
   for t in $DEFAULT_INSTANCE_TYPE $FALLBACK_INSTANCE_TYPES; do
     [[ "$t" =~ ^[a-z0-9-]+\.[a-z0-9-]+$ ]] || die "机型名称无效: '$t'"
+  done
+  [[ -z "$KEY_NAME" || "$KEY_NAME" =~ ^[A-Za-z0-9._-]{1,255}$ ]] || die "KEY_NAME 无效: '$KEY_NAME'"
+  [[ "$BASTION_INSTANCE_TYPE" =~ ^[a-z0-9-]+\.[a-z0-9-]+$ ]] || die "BASTION_INSTANCE_TYPE 无效"
+  # shellcheck disable=SC2015
+  [[ "$BASTION_ROOT_VOLUME_GB" =~ ^[0-9]+$ ]] && (( BASTION_ROOT_VOLUME_GB >= 30 )) \
+    || die "BASTION_ROOT_VOLUME_GB 至少 30"
+  local b
+  for b in $OPS_EXTRA_BUCKETS; do
+    [[ "$b" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]] || die "OPS_EXTRA_BUCKETS 中的 bucket 名无效: '$b'"
   done
   [[ "$CAPACITY_RETRY_ROUNDS" =~ ^[1-9][0-9]*$ && "$CAPACITY_RETRY_INTERVAL_SEC" =~ ^[0-9]+$ ]] \
     || die "CAPACITY_RETRY_ROUNDS / CAPACITY_RETRY_INTERVAL_SEC 必须是整数"

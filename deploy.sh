@@ -5,10 +5,12 @@ source "$(dirname "$0")/lib/common.sh"
 source "$ROOT_DIR/lib/gpu.sh"
 source "$ROOT_DIR/lib/ami.sh"
 source "$ROOT_DIR/lib/instance.sh"
+source "$ROOT_DIR/lib/keypair.sh"
+source "$ROOT_DIR/lib/cidr.sh"
 
 usage() {
   cat <<'EOF'
-用法: ./deploy.sh [-y|--yes] [--add]
+用法: ./deploy.sh [-y|--yes] [--add] [--no-instance]
 
 交互式完成:
   1. 列出 Region 内 GPU 机型及可用 AZ，选择机型 (默认 g6.12xlarge)
@@ -18,74 +20,17 @@ usage() {
   5. 跨 AZ 抢占 GPU 容量创建实例，注册到 NLB，等待 vLLM 就绪
 
   -y, --yes   非交互模式，全部使用 config.env 中的默认值 (ALLOWED_CIDRS 必须已设置)
-  --add       已有 vLLM 实例时仍新增一台 (默认: 已有实例则只更新栈，不再创建实例)
+  --add          已有 vLLM 实例时仍新增一台 (默认: 已有实例则只更新栈，不再创建实例)
+  --no-instance  只创建网络栈与推理栈，不创建 GPU 实例 (之后用 ./launch-instance.sh 创建)
 
 可重复执行: 中断 (如 CloudShell 会话超时) 后直接重跑，会等待进行中的栈并跳过已完成的步骤。
 配置: 编辑 config.env 或用同名环境变量覆盖
 EOF
 }
 
-cidr_re='^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})/([0-9]|[12][0-9]|3[0-2])$'
-
-valid_cidr() {
-  [[ "$1" =~ $cidr_re ]] || return 1
-  local i
-  for i in 1 2 3 4; do (( BASH_REMATCH[i] <= 255 )) || return 1; done
-}
-
-deployed_allowed_cidrs() {
-  stack_ready "$INFERENCE_STACK" || return 0
-  aws cloudformation describe-stacks --stack-name "$INFERENCE_STACK" --output json \
-    --query "Stacks[0].Parameters[?starts_with(ParameterKey,'AllowedCidr')]" \
-  | jq -r 'sort_by(.ParameterKey | ltrimstr("AllowedCidr") | tonumber)
-           | map(.ParameterValue | select(. != "")) | join(",")'
-}
-
-# AllowedCidr1..10 参数 (未使用的槽位传空串)
-cidr_params() {
-  local arr i
-  IFS=',' read -ra arr <<<"$ALLOWED_CIDRS"
-  for i in $(seq 1 10); do printf 'AllowedCidr%d=%s\n' "$i" "${arr[i-1]:-}"; done
-}
-
 resolve_allowed_cidrs() {
-  if [[ -z "$ALLOWED_CIDRS" ]]; then
-    local def=""
-    def="$(deployed_allowed_cidrs)"
-    if [[ -n "$def" && "$def" != "None" ]]; then
-      log "沿用已部署的来源 CIDR: $def"
-    elif is_cloudshell; then
-      # CloudShell 的出口 IP 不是用户本机 IP，不能作为默认值
-      def=""
-      warn "在 CloudShell 中无法自动获取你本机的公网 IP，请在本机浏览器打开 https://checkip.amazonaws.com 查看"
-    else
-      def="$(curl -fsS --max-time 5 https://checkip.amazonaws.com 2>/dev/null | tr -d '[:space:]' || true)"
-      def="${def:+$def/32}"
-    fi
-    [[ "$ASSUME_YES" == "1" && -z "$def" ]] && die "非交互模式下必须设置 ALLOWED_CIDRS"
-    ALLOWED_CIDRS="$(prompt_default "允许访问推理服务的来源 CIDR (逗号分隔，如 203.0.113.10/32)" "$def")"
-  fi
-  ALLOWED_CIDRS="${ALLOWED_CIDRS// /}"
-  [[ -n "$ALLOWED_CIDRS" ]] || die "ALLOWED_CIDRS 不能为空"
-  local c uniq=()
-  IFS=',' read -ra _cidrs <<<"$ALLOWED_CIDRS"
-  for c in "${_cidrs[@]}"; do
-    [[ -z "$c" ]] && continue
-    valid_cidr "$c" || die "CIDR 格式错误: '$c'"
-    [[ " ${uniq[*]} " == *" $c "* ]] && continue
-    uniq+=("$c")
-    if (( ${c##*/} < 8 )); then   # 前缀短于 /8 (含 0.0.0.0/0、0.0.0.0/1) 视为公网
-      warn "$c 会把推理服务暴露给整个互联网 (仅靠 API Key 防护)"
-      if [[ "$ASSUME_YES" == "1" ]]; then
-        [[ "${ALLOW_PUBLIC_CIDR:-0}" == "1" ]] || die "非交互模式下使用 $c 需设置 ALLOW_PUBLIC_CIDR=1"
-      else
-        confirm "确认使用 $c?" || exit 1
-      fi
-    fi
-  done
-  (( ${#uniq[@]} <= 10 )) || die "ALLOWED_CIDRS 最多 10 个"
-  ALLOWED_CIDRS="$(IFS=,; echo "${uniq[*]}")"
-  ok "允许来源: $ALLOWED_CIDRS"
+  ALLOWED_CIDRS="$(resolve_cidr_list "$ALLOWED_CIDRS" "$INFERENCE_STACK" AllowedCidr 10 "推理服务 (NLB)")"
+  ok "推理服务允许来源: $ALLOWED_CIDRS"
 }
 
 # 选择网络栈的两个 AZ: 已存在则沿用; 否则优先选择提供所选机型的 AZ
@@ -100,14 +45,15 @@ resolve_azs() {
     return
   fi
   local azs=() all az
-  mapfile -t azs < <(jq -r --arg t "$INSTANCE_TYPE" '.[] | select(.type == $t) | .azs[]' <<<"$GPU_CATALOG_JSON")
+  local az_type="${AZ_SELECT_TYPE:-$INSTANCE_TYPE}"
+  mapfile -t azs < <(jq -r --arg t "$az_type" '.[] | select(.type == $t) | .azs[]' <<<"$GPU_CATALOG_JSON")
   if (( ${#azs[@]} < 2 )); then
     all="$(aws ec2 describe-availability-zones --filters Name=zone-type,Values=availability-zone \
             --query 'AvailabilityZones[].ZoneName' --output text)"
     for az in $all; do [[ " ${azs[*]} " == *" $az "* ]] || azs+=("$az"); done
   fi
   AZ_A="${azs[0]}"; AZ_B="${azs[1]}"
-  log "网络栈 AZ: $AZ_A, $AZ_B (按 $INSTANCE_TYPE 的供应情况选择)"
+  log "网络栈 AZ: $AZ_A, $AZ_B (按 $az_type 的供应情况选择)"
 }
 
 resolve_bucket() {
@@ -133,9 +79,13 @@ resolve_bucket() {
 }
 
 main() {
-  local add=0 rest=() a
+  local add=0 no_instance=0 rest=() a
   for a in "$@"; do
-    if [[ "$a" == "--add" ]]; then add=1; else rest+=("$a"); fi
+    case "$a" in
+      --add) add=1 ;;
+      --no-instance) no_instance=1 ;;
+      *) rest+=("$a") ;;
+    esac
   done
   parse_common_flags "${rest[@]+"${rest[@]}"}"
   load_config
@@ -149,14 +99,18 @@ main() {
                 "Name=instance-state-name,Values=pending,running,stopping,stopped" \
       --query 'Reservations[].Instances[].InstanceId' --output text)"
   fi
-  if [[ -n "$old" ]] && (( ! add )); then
+  if (( no_instance )); then
+    skip_launch=1
+    log "--no-instance: 只部署网络栈与推理栈"
+  elif [[ -n "$old" ]] && (( ! add )); then
     skip_launch=1
     warn "已存在 vLLM 实例: $old —— 本次只更新栈，不创建新实例 (新增用 --add，替换用 ./launch-instance.sh --replace)"
   fi
 
   build_gpu_catalog "$INSTANCE_FAMILIES"
   if (( skip_launch )); then
-    INSTANCE_TYPE="<不变>"; AMI_ID="<不变>"; AMI_NAME=""; SKIP_TYPE_CHECK=1
+    INSTANCE_TYPE="<不创建>"; AMI_ID="<不创建>"; AMI_NAME=""; SKIP_TYPE_CHECK=1
+    AZ_SELECT_TYPE="$DEFAULT_INSTANCE_TYPE"
   else
     log "==== 1/5 选择 GPU 机型 ===="
     SHOW_CAPACITY_SCORE=1 select_instance_type
@@ -191,7 +145,7 @@ EOF
 
   log "==== 4/5 部署推理栈 ===="
   local cidr_args=()
-  mapfile -t cidr_args < <(cidr_params)
+  mapfile -t cidr_args < <(cidr_slot_params AllowedCidr 10 "$ALLOWED_CIDRS")
   deploy_stack "$INFERENCE_STACK" "$ROOT_DIR/cfn/inference.yaml" \
     "ProjectName=$PROJECT_NAME" \
     "VpcId=$(stack_output "$NETWORK_STACK" VpcId)" \

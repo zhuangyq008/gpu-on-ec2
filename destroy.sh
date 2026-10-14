@@ -46,7 +46,7 @@ main() {
   cat >&2 <<EOF
 将在 $AWS_REGION 删除:
   GPU 实例   : ${ids:-无}
-  CFN 栈     : $INFERENCE_STACK, $NETWORK_STACK
+  CFN 栈     : $BASTION_STACK (如存在), $INFERENCE_STACK, $NETWORK_STACK
   保留       : S3 bucket ${bucket:-无} (模型权重)
 EOF
   confirm "确认删除?" || exit 0
@@ -58,12 +58,22 @@ EOF
     wait_terminated $ids
     ok "实例已终止"
   fi
+  # 跳板机栈在 GPU 实例 SG 上添加了规则，必须先于推理栈删除
+  delete_stack "$BASTION_STACK"
   delete_stack "$INFERENCE_STACK"
   # CFN 删除 secret 默认进入 30 天恢复期，同名重建会冲突，这里立即彻底删除
   if [[ -n "$secret" && "$secret" != "None" ]]; then
     aws secretsmanager delete-secret --secret-id "$secret" --force-delete-without-recovery >/dev/null 2>&1 || true
   fi
   delete_stack "$NETWORK_STACK"
+
+  if [[ -z "$KEY_NAME" ]] && aws ec2 describe-key-pairs --key-names "$OPS_KEY_NAME" >/dev/null 2>&1; then
+    cat >&2 <<EOF
+
+运维 key pair $OPS_KEY_NAME 已保留 (下次部署复用)。如需删除:
+  aws ec2 delete-key-pair --region $AWS_REGION --key-name $OPS_KEY_NAME && rm -f $SSH_KEY_DIR/$OPS_KEY_NAME.pem
+EOF
+  fi
 
   if [[ -n "$bucket" && "$bucket" != "None" ]]; then
     cat >&2 <<EOF

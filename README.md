@@ -19,6 +19,8 @@
 │  ┌─ Public Subnet A ─────────┐      ┌─ Public Subnet B ─────────┐       │
 │  │  NLB (SG: allowed CIDRs)  │      │  NLB (cross-zone)         │       │
 │  │  NAT Gateway              │      │  [NAT Gateway] (per-az)   │       │
+│  │  运维跳板机 (EIP) ◀── SSH(SSH_ALLOWED_CIDRS) / SSM                   │
+│  │     └─ SSH :22 / vLLM :8000 ──▶ GPU EC2；读写模型 bucket             │
 │  └────────────┬──────────────┘      └────────────┬──────────────┘       │
 │               │ TCP :8000 (SG: 仅来自 NLB SG)      │                      │
 │  ┌─ Private Subnet A ────────┐      ┌─ Private Subnet B ────────┐       │
@@ -54,10 +56,12 @@ S3 已有 _LLM_COMPLETE ──是──▶ aws s3 sync S3 → NVMe（走 Gateway
 ├── list-gpu.sh           # 列出 GPU 机型 / AZ / 配额 / 容量参考分
 ├── launch-instance.sh    # 单独创建或替换 GPU 实例 (换机型 / AMI / 模型)
 ├── status.sh             # 查看状态，--test 做冒烟测试
-├── destroy.sh            # 销毁全部资源 (S3 bucket 保留)
+├── deploy-bastion.sh     # 创建/更新运维跳板机 (SSH + SSM，可访问 GPU 实例和 S3)
+├── destroy.sh            # 销毁全部资源 (S3 bucket、运维 key pair 保留)
 ├── cfn/
 │   ├── network.yaml      # VPC / Subnets / IGW / NAT / S3 Endpoint
-│   └── inference.yaml    # NLB / SG / IAM / Secret / S3 / Logs
+│   ├── inference.yaml    # NLB / SG / IAM / Secret / S3 / Logs
+│   └── bastion.yaml      # 运维跳板机 / EIP / SG 规则 / IAM
 ├── instance/             # 通过 user-data 下发到 EC2
 │   ├── prepare.sh        # NVMe RAID0 + 权重准备
 │   ├── run-vllm.sh       # docker run vLLM
@@ -183,12 +187,35 @@ print(resp.choices[0].message.content)
 | 换模型 / 机型 / AMI，零停机 | 修改 `config.env` → `./launch-instance.sh --replace`（新实例 healthy 后才下线旧实例） |
 | 横向扩容 | `./launch-instance.sh` 或 `./deploy.sh --add`（新增一台，NLB 自动负载均衡） |
 | 修改来源白名单 | 修改 `ALLOWED_CIDRS` → `./deploy.sh`（已有实例时只更新栈） |
-| 登录实例 | `aws ssm start-session --target <instance-id>`（没有 SSH，不需要 key pair） |
+| 登录实例 | `aws ssm start-session --target <instance-id>`，或经跳板机 SSH（见"运维跳板机"一节） |
+| 只建基础设施 | `./deploy.sh --no-instance`（之后再用 `./launch-instance.sh` 创建 GPU 实例） |
 | 查看启动进度 | 实例上执行 `sudo journalctl -u vllm -f` |
 | vLLM 日志 | CloudWatch Logs `/<project>/vllm`，或在实例上执行 `docker logs -f vllm` |
 | 重启服务 | `sudo systemctl restart vllm` |
 | 轮换 API Key | 在 Secrets Manager 中更新 secret → `sudo systemctl restart vllm` |
 | 销毁 | `./destroy.sh`（S3 权重保留，下次部署自动复用） |
+
+## 运维跳板机
+
+```bash
+SSH_ALLOWED_CIDRS="203.0.113.10/32" ./deploy-bastion.sh
+```
+
+- **位置**：public subnet A，绑定 EIP（IP 固定，方便客户加进防火墙白名单）。机型 `t3.small`，系统 Amazon Linux 2023。
+- **登录方式**：
+  - **SSH**：来源限定为 `SSH_ALLOWED_CIDRS`（最多 5 个），用户名 `ec2-user`。
+  - **SSM**：`aws ssm start-session --target <跳板机ID>`，不需要 key，也不需要开放端口。
+- **SSH Key**：`KEY_NAME` 留空时，自动创建 `<project>-ops`（ed25519），私钥保存到 `~/.ssh/<project>-ops.pem`。在 CloudShell 中可以通过 **Actions → Download file** 下载到本机。也可以把 `KEY_NAME` 设为已有 key pair 的名称。
+- **访问 GPU 实例**：跳板机可以访问 GPU 实例的 22 和 8000 端口。
+  - **SSH**：跳板机创建**之后**再创建的 GPU 实例会自动挂载同一把 key。可以在本机用 `ssh -i <pem> -J ec2-user@<EIP> ec2-user@<GPU私网IP>` 一步登录。
+  - **SSM**：在跳板机上执行 `aws ssm start-session --target <GPU实例ID>`，不依赖 key。
+  - **已有的 GPU 实例**：之前创建、没有挂载 key 的实例只能走 SSM；如果需要 SSH，执行 `./launch-instance.sh --replace` 重建。
+- **S3**：可以读写模型 bucket，以及 `OPS_EXTRA_BUCKETS` 中列出的 bucket（空格分隔）。
+- **内置命令**：
+  - `gpu-list`：列出 GPU 实例及其私网 IP。
+  - `vllm-key`：输出 API Key，例如 `curl -H "Authorization: Bearer $(vllm-key)" http://<GPU私网IP>:8000/v1/models`。
+  - 环境变量 `$MODEL_BUCKET` 已预先设置好。
+- **修改配置**：修改 `SSH_ALLOWED_CIDRS` 或 `OPS_EXTRA_BUCKETS` 后，重新执行 `./deploy-bastion.sh` 即可。执行 `destroy.sh` 时会先删除跳板机栈。
 
 ## GPU 容量获取建议
 
@@ -201,7 +228,8 @@ GPU 不是每个 AZ 都有供应，而且经常出现 `InsufficientInstanceCapac
 
 ## 安全设计
 
-- GPU 实例放在 private subnet，没有公网 IP、不开 SSH，运维通过 SSM 进行。
+- GPU 实例放在 private subnet，没有公网 IP。SSH 只允许来自跳板机 SG，也可以通过 SSM 访问。
+- 跳板机的 SSH 只放行 `SSH_ALLOWED_CIDRS`，并强制 IMDSv2。IAM 权限只包含：项目内 bucket 的读写、本项目 API Key 的读取、vLLM 日志的读取，以及对带本项目 Tag 的实例发起 SSM 会话。
 - 实例 SG 只放行来自 NLB SG 的 8000 端口；NLB SG 只放行 `ALLOWED_CIDRS`。
 - vLLM 的 `/v1/*` 接口需要 `Authorization: Bearer <API_KEY>`。API Key 由 Secrets Manager 生成，在实例上只写入 tmpfs（`/run/llm`），不会出现在 user-data 或进程参数中。
 - 强制使用 IMDSv2，hop limit = 1，容器内无法获取实例凭证。

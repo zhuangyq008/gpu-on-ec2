@@ -9,6 +9,7 @@ source "$(dirname "$0")/lib/common.sh"
 source "$ROOT_DIR/lib/gpu.sh"
 source "$ROOT_DIR/lib/ami.sh"
 source "$ROOT_DIR/lib/instance.sh"
+source "$ROOT_DIR/lib/keypair.sh"
 
 usage() {
   cat <<'EOF'

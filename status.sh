@@ -42,12 +42,19 @@ main() {
   aws ec2 describe-instances \
     --filters "Name=tag:Project,Values=$PROJECT_NAME" "Name=tag:Role,Values=$INSTANCE_ROLE_TAG" \
               "Name=instance-state-name,Values=pending,running,stopping,stopped" \
-    --query 'Reservations[].Instances[].[InstanceId,InstanceType,Placement.AvailabilityZone,State.Name,PrivateIpAddress,ImageId,LaunchTime]' \
+    --query 'Reservations[].Instances[].[InstanceId,InstanceType,Placement.AvailabilityZone,State.Name,PrivateIpAddress,KeyName,LaunchTime]' \
     --output table >&2
   log "Target Group 健康状态:"
   aws elbv2 describe-target-health --target-group-arn "$TARGET_GROUP_ARN" \
     --query 'TargetHealthDescriptions[].[Target.Id,TargetHealth.State,TargetHealth.Reason]' --output table >&2
   print_endpoint_info
+  if stack_ready "$BASTION_STACK"; then
+    local ip iid
+    ip="$(stack_output "$BASTION_STACK" BastionPublicIp)"
+    iid="$(stack_output "$BASTION_STACK" BastionInstanceId)"
+    printf '\n 跳板机   : %s (%s)  ssh -i %s/%s.pem ec2-user@%s  |  aws ssm start-session --target %s\n' \
+      "$iid" "$ip" "$SSH_KEY_DIR" "$OPS_KEY_NAME" "$ip" "$iid" >&2
+  fi
   (( test )) && smoke_test
   return 0
 }
