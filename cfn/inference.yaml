@@ -1,0 +1,440 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  GPU-on-EC2 推理层: internet-facing NLB + Security Groups + IAM Instance Profile +
+  API Key (Secrets Manager) + 模型权重 S3 Bucket + CloudWatch Logs。
+  GPU 实例由 launch-instance.sh 按 AZ 容量自动选择后创建并注册到 Target Group。
+
+Parameters:
+  ProjectName:
+    Type: String
+    AllowedPattern: "^[a-z][a-z0-9-]{1,20}$"
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  VpcCidr:
+    Type: String
+  PublicSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+  AllowedCidr1:
+    Type: String
+    Description: 允许访问推理端口的来源 CIDR (AllowedCidr1-10，至少填写 1 个)
+    AllowedPattern: "^(\\d{1,3}\\.){3}\\d{1,3}/\\d{1,2}$"
+  AllowedCidr2:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^(\\d{1,3}\\.){3}\\d{1,3}/\\d{1,2}$"
+  AllowedCidr3:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^(\\d{1,3}\\.){3}\\d{1,3}/\\d{1,2}$"
+  AllowedCidr4:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^(\\d{1,3}\\.){3}\\d{1,3}/\\d{1,2}$"
+  AllowedCidr5:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^(\\d{1,3}\\.){3}\\d{1,3}/\\d{1,2}$"
+  AllowedCidr6:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^(\\d{1,3}\\.){3}\\d{1,3}/\\d{1,2}$"
+  AllowedCidr7:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^(\\d{1,3}\\.){3}\\d{1,3}/\\d{1,2}$"
+  AllowedCidr8:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^(\\d{1,3}\\.){3}\\d{1,3}/\\d{1,2}$"
+  AllowedCidr9:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^(\\d{1,3}\\.){3}\\d{1,3}/\\d{1,2}$"
+  AllowedCidr10:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^(\\d{1,3}\\.){3}\\d{1,3}/\\d{1,2}$"
+  ListenerPort:
+    Type: Number
+    Default: 8000
+    MinValue: 1
+    MaxValue: 65535
+  ModelBucketName:
+    Type: String
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+  CreateModelBucket:
+    Type: String
+    AllowedValues: ["true", "false"]
+  ModelS3Prefix:
+    Type: String
+    Default: models
+  HfTokenSecretArn:
+    Type: String
+    Default: ""
+    Description: 可选，gated 模型所需的 HF token secret ARN
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+
+Conditions:
+  DoCreateBucket: !Equals [!Ref CreateModelBucket, "true"]
+  HasHfToken: !Not [!Equals [!Ref HfTokenSecretArn, ""]]
+  HasCidr2: !Not [!Equals [!Ref AllowedCidr2, ""]]
+  HasCidr3: !Not [!Equals [!Ref AllowedCidr3, ""]]
+  HasCidr4: !Not [!Equals [!Ref AllowedCidr4, ""]]
+  HasCidr5: !Not [!Equals [!Ref AllowedCidr5, ""]]
+  HasCidr6: !Not [!Equals [!Ref AllowedCidr6, ""]]
+  HasCidr7: !Not [!Equals [!Ref AllowedCidr7, ""]]
+  HasCidr8: !Not [!Equals [!Ref AllowedCidr8, ""]]
+  HasCidr9: !Not [!Equals [!Ref AllowedCidr9, ""]]
+  HasCidr10: !Not [!Equals [!Ref AllowedCidr10, ""]]
+
+Resources:
+  # ---------------- S3: 模型权重 ----------------
+  ModelBucket:
+    Type: AWS::S3::Bucket
+    Condition: DoCreateBucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Ref ModelBucketName
+      VersioningConfiguration:
+        Status: Enabled
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: abort-incomplete-mpu
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 3
+          - Id: expire-noncurrent-versions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+      Tags:
+        - { Key: Name, Value: !Ref ModelBucketName }
+
+  ModelBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: DoCreateBucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Bucket: !Ref ModelBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !Sub "arn:${AWS::Partition}:s3:::${ModelBucketName}"
+              - !Sub "arn:${AWS::Partition}:s3:::${ModelBucketName}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  # ---------------- API Key ----------------
+  ApiKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: vLLM OpenAI-compatible API key (Authorization Bearer)
+      GenerateSecretString:
+        PasswordLength: 48
+        ExcludePunctuation: true
+
+  # ---------------- Logs ----------------
+  VllmLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/${ProjectName}/vllm"
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ---------------- IAM ----------------
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-gpu-instance-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: !Sub "ec2.${AWS::URLSuffix}" }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
+      Policies:
+        - PolicyName: model-and-runtime
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ListModelPrefix
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${ModelBucketName}"
+                Condition:
+                  StringLike:
+                    s3:prefix:
+                      - !Sub "${ModelS3Prefix}/*"
+              - Sid: ReadWriteModelObjects
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:AbortMultipartUpload
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${ModelBucketName}/${ModelS3Prefix}/*"
+              - Sid: ReadSecrets
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !If
+                  - HasHfToken
+                  - [!Ref ApiKeySecret, !Ref HfTokenSecretArn]
+                  - [!Ref ApiKeySecret]
+              - Sid: WriteVllmLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: !Sub "${VllmLogGroup.Arn}:*"
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${ProjectName}-gpu-instance-${AWS::Region}"
+      Roles: [!Ref InstanceRole]
+
+  # ---------------- Security Groups ----------------
+  NlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${ProjectName} NLB - inference port from allowed CIDRs"
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          CidrIp: !Ref VpcCidr
+          Description: to vLLM targets
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-nlb-sg" }
+
+  NlbIngress1:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ListenerPort
+      ToPort: !Ref ListenerPort
+      CidrIp: !Ref AllowedCidr1
+      Description: allowed client
+
+  NlbIngress2:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasCidr2
+    Properties:
+      GroupId: !Ref NlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ListenerPort
+      ToPort: !Ref ListenerPort
+      CidrIp: !Ref AllowedCidr2
+      Description: allowed client
+
+  NlbIngress3:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasCidr3
+    Properties:
+      GroupId: !Ref NlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ListenerPort
+      ToPort: !Ref ListenerPort
+      CidrIp: !Ref AllowedCidr3
+      Description: allowed client
+
+  NlbIngress4:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasCidr4
+    Properties:
+      GroupId: !Ref NlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ListenerPort
+      ToPort: !Ref ListenerPort
+      CidrIp: !Ref AllowedCidr4
+      Description: allowed client
+
+  NlbIngress5:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasCidr5
+    Properties:
+      GroupId: !Ref NlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ListenerPort
+      ToPort: !Ref ListenerPort
+      CidrIp: !Ref AllowedCidr5
+      Description: allowed client
+
+  NlbIngress6:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasCidr6
+    Properties:
+      GroupId: !Ref NlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ListenerPort
+      ToPort: !Ref ListenerPort
+      CidrIp: !Ref AllowedCidr6
+      Description: allowed client
+
+  NlbIngress7:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasCidr7
+    Properties:
+      GroupId: !Ref NlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ListenerPort
+      ToPort: !Ref ListenerPort
+      CidrIp: !Ref AllowedCidr7
+      Description: allowed client
+
+  NlbIngress8:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasCidr8
+    Properties:
+      GroupId: !Ref NlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ListenerPort
+      ToPort: !Ref ListenerPort
+      CidrIp: !Ref AllowedCidr8
+      Description: allowed client
+
+  NlbIngress9:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasCidr9
+    Properties:
+      GroupId: !Ref NlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ListenerPort
+      ToPort: !Ref ListenerPort
+      CidrIp: !Ref AllowedCidr9
+      Description: allowed client
+
+  NlbIngress10:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasCidr10
+    Properties:
+      GroupId: !Ref NlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ListenerPort
+      ToPort: !Ref ListenerPort
+      CidrIp: !Ref AllowedCidr10
+      Description: allowed client
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${ProjectName} GPU instance - vLLM 8000 from NLB only"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          SourceSecurityGroupId: !Ref NlbSecurityGroup
+          Description: from NLB (traffic + health check)
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS to Hugging Face / Docker Hub / AWS APIs
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP for OS package repositories
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Ref VpcCidr
+          Description: DNS
+        - IpProtocol: tcp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Ref VpcCidr
+          Description: DNS
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-gpu-sg" }
+
+  # ---------------- NLB ----------------
+  Nlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${ProjectName}-nlb"
+      Type: network
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      Subnets: !Ref PublicSubnetIds
+      SecurityGroups: [!Ref NlbSecurityGroup]
+      LoadBalancerAttributes:
+        - Key: load_balancing.cross_zone.enabled
+          Value: "true"
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${ProjectName}-vllm-tg"
+      VpcId: !Ref VpcId
+      Protocol: TCP
+      Port: 8000
+      TargetType: instance
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /health
+      HealthCheckPort: traffic-port
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 3
+      UnhealthyThresholdCount: 3
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "60"
+        - Key: preserve_client_ip.enabled
+          Value: "true"
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Nlb
+      Protocol: TCP
+      Port: !Ref ListenerPort
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+Outputs:
+  NlbDnsName:
+    Value: !GetAtt Nlb.DNSName
+  ListenerPort:
+    Value: !Ref ListenerPort
+  TargetGroupArn:
+    Value: !Ref TargetGroup
+  InstanceSecurityGroupId:
+    Value: !Ref InstanceSecurityGroup
+  InstanceProfileName:
+    Value: !Ref InstanceProfile
+  ApiKeySecretArn:
+    Value: !Ref ApiKeySecret
+  ModelBucketName:
+    Value: !Ref ModelBucketName
+  ModelS3Prefix:
+    Value: !Ref ModelS3Prefix
+  LogGroupName:
+    Value: !Ref VllmLogGroup

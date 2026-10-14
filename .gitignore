@@ -1,0 +1,6 @@
+# 本地覆盖配置 / 临时文件
+config.local.env
+*.log
+*.gz
+.DS_Store
+.claude/
