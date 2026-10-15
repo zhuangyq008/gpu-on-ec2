@@ -66,7 +66,8 @@ validate_config() {
     [[ "$t" =~ ^[a-z0-9-]+\.[a-z0-9-]+$ ]] || die "机型名称无效: '$t'"
   done
   [[ -z "$KEY_NAME" || "$KEY_NAME" =~ ^[A-Za-z0-9._-]{1,255}$ ]] || die "KEY_NAME 无效: '$KEY_NAME'"
-  [[ "$BASTION_INSTANCE_TYPE" =~ ^[a-z0-9-]+\.[a-z0-9-]+$ ]] || die "BASTION_INSTANCE_TYPE 无效"
+  [[ -z "$BASTION_INSTANCE_TYPE" || "$BASTION_INSTANCE_TYPE" =~ ^[a-z0-9-]+\.[a-z0-9-]+$ ]] \
+    || die "BASTION_INSTANCE_TYPE 无效"
   # shellcheck disable=SC2015
   [[ "$BASTION_ROOT_VOLUME_GB" =~ ^[0-9]+$ ]] && (( BASTION_ROOT_VOLUME_GB >= 30 )) \
     || die "BASTION_ROOT_VOLUME_GB 至少 30"
@@ -198,6 +199,7 @@ stack_output() {
 }
 
 # deploy_stack <stack> <template> [Key=Value ...]
+# DEPLOY_STACK_NO_DIE=1 时失败返回 1 (由调用方决定是否重试)，失败原因存入 DEPLOY_STACK_ERROR
 deploy_stack() {
   local stack="$1" tpl="$2"; shift 2
   local status
@@ -215,9 +217,11 @@ deploy_stack() {
       --no-fail-on-empty-changeset \
       --tags "Project=$PROJECT_NAME" \
       --parameter-overrides "$@"; then
-    aws cloudformation describe-stack-events --stack-name "$stack" --max-items 30 \
+    DEPLOY_STACK_ERROR="$(aws cloudformation describe-stack-events --stack-name "$stack" --max-items 30 \
       --query "StackEvents[?contains(ResourceStatus,'FAILED')].[LogicalResourceId,ResourceStatusReason]" \
-      --output table >&2 || true
+      --output text 2>/dev/null || true)"
+    printf '%s\n' "$DEPLOY_STACK_ERROR" | head -5 | cut -c1-300 >&2
+    [[ "${DEPLOY_STACK_NO_DIE:-0}" == "1" ]] && return 1
     die "栈 $stack 部署失败"
   fi
   ok "栈 $stack 就绪"

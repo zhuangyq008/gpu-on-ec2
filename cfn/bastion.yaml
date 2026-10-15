@@ -20,6 +20,11 @@ Parameters:
     Type: Number
     Default: 50
     MinValue: 30
+  Arch:
+    Type: String
+    AllowedValues: [x86_64, arm64]
+    Default: x86_64
+    Description: 机型架构，需与 ImageId 一致
   ImageId:
     Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
     Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
@@ -62,6 +67,7 @@ Parameters:
     AllowedPattern: "^$|^(\\d{1,3}\\.){3}\\d{1,3}/\\d{1,2}$"
 
 Conditions:
+  IsArm: !Equals [!Ref Arch, arm64]
   HasSshCidr2: !Not [!Equals [!Ref SshCidr2, ""]]
   HasSshCidr3: !Not [!Equals [!Ref SshCidr3, ""]]
   HasSshCidr4: !Not [!Equals [!Ref SshCidr4, ""]]
@@ -207,6 +213,7 @@ Resources:
                 # Describe 类 API 不支持资源级权限，只读
                 Action:
                   - ec2:DescribeInstances
+                  - ec2:DescribeInstanceTypes
                   - elasticloadbalancing:DescribeTargetHealth
                   - elasticloadbalancing:DescribeTargetGroups
                 Resource: "*"
@@ -276,45 +283,75 @@ Resources:
               - { Key: Name, Value: !Sub "${ProjectName}-bastion-root" }
               - { Key: Project, Value: !Ref ProjectName }
         UserData:
-          Fn::Base64: !Sub |
-            #!/bin/bash
-            set -uo pipefail
-            exec > >(tee -a /var/log/bastion-userdata.log) 2>&1
-            for i in 1 2 3 4 5 6 7 8 9 10; do
-              dnf install -y -q jq tmux && break
-              echo "dnf 重试 $i"; sleep 10
-            done
-            rpm -q session-manager-plugin >/dev/null 2>&1 || \
-              dnf install -y -q https://s3.amazonaws.com/session-manager-downloads/plugin/latest/linux_64bit/session-manager-plugin.rpm
-            cat >/etc/profile.d/llm-ops.sh <<'__ENV__'
-            export AWS_REGION='${AWS::Region}'
-            export AWS_DEFAULT_REGION='${AWS::Region}'
-            export LLM_PROJECT='${ProjectName}'
-            export MODEL_BUCKET='${ModelBucketName}'
-            export API_KEY_SECRET_ARN='${ApiKeySecretArn}'
-            export VLLM_LOG_GROUP='${LogGroupName}' 
-            __ENV__
-            cat >/usr/local/bin/gpu-list <<'__SCRIPT__'
-            #!/bin/bash
-            # 列出本项目的 GPU 实例 (登录: ssh ec2-user@<PrivateIp>  或  aws ssm start-session --target <InstanceId>)
-            aws ec2 describe-instances \
-              --filters "Name=tag:Project,Values=$LLM_PROJECT" "Name=tag:Role,Values=vllm" \
-                        "Name=instance-state-name,Values=pending,running" \
-              --query 'Reservations[].Instances[].[InstanceId,InstanceType,Placement.AvailabilityZone,PrivateIpAddress,KeyName,State.Name]' \
-              --output table
-            __SCRIPT__
-            cat >/usr/local/bin/vllm-key <<'__SCRIPT__'
-            #!/bin/bash
-            # 输出 vLLM API Key，例如: curl -H "Authorization: Bearer $(vllm-key)" http://<PrivateIp>:8000/v1/models
-            aws secretsmanager get-secret-value --secret-id "$API_KEY_SECRET_ARN" --query SecretString --output text
-            __SCRIPT__
-            chmod 755 /usr/local/bin/gpu-list /usr/local/bin/vllm-key
-            if command -v jq >/dev/null && session-manager-plugin --version >/dev/null 2>&1; then
-              echo "bastion ready"
-            else
-              echo "ERROR: jq / session-manager-plugin 安装失败，请查看 /var/log/bastion-userdata.log"
-              exit 1
-            fi
+          Fn::Base64: !Sub
+            - |
+              #!/bin/bash
+              set -uo pipefail
+              exec > >(tee -a /var/log/bastion-userdata.log) 2>&1
+              for i in 1 2 3 4 5 6 7 8 9 10; do
+                dnf install -y -q jq tmux && break
+                echo "dnf 重试 $i"; sleep 10
+              done
+              rpm -q session-manager-plugin >/dev/null 2>&1 || \
+                dnf install -y -q https://s3.amazonaws.com/session-manager-downloads/plugin/latest/${SsmPluginPath}/session-manager-plugin.rpm
+              cat >/etc/profile.d/llm-ops.sh <<'__ENV__'
+              export AWS_REGION='${AWS::Region}'
+              export AWS_DEFAULT_REGION='${AWS::Region}'
+              export LLM_PROJECT='${ProjectName}'
+              export MODEL_BUCKET='${ModelBucketName}'
+              export API_KEY_SECRET_ARN='${ApiKeySecretArn}'
+              export VLLM_LOG_GROUP='${LogGroupName}' 
+              __ENV__
+              cat >/usr/local/bin/gpu-list <<'__SCRIPT__'
+              #!/bin/bash
+              # 列出 GPU 机器 (按机型是否带 GPU 判断，不依赖 Role 标签):
+              #   gpu-list          本项目: 标签 Project=$LLM_PROJECT，或与跳板机同 VPC 的实例
+              #   gpu-list --all    本 Region 所有 GPU 实例
+              # 登录: 同 VPC 可 ssh ec2-user@<PrivateIp> (实例需挂载 key)；任意实例可 aws ssm start-session --target <InstanceId>
+              set -euo pipefail
+              states="Name=instance-state-name,Values=pending,running,stopping,stopped"
+              my_vpc=$(aws ec2 describe-instances --instance-ids "$(cat /var/lib/cloud/data/instance-id)" \
+                --query 'Reservations[0].Instances[0].VpcId' --output text)
+              q='Reservations[].Instances[]'
+              if [ "${!1:-}" = "--all" ]; then
+                inst=$(aws ec2 describe-instances --filters "$states" --query "$q" --output json)
+              else
+                by_tag=$(aws ec2 describe-instances --filters "$states" "Name=tag:Project,Values=$LLM_PROJECT" --query "$q" --output json)
+                by_vpc=$(aws ec2 describe-instances --filters "$states" "Name=vpc-id,Values=$my_vpc" --query "$q" --output json)
+                inst=$(printf '%s\n%s' "$by_tag" "$by_vpc" | jq -s 'add | unique_by(.InstanceId)')
+              fi
+              types=$(jq -r '[.[].InstanceType] | unique | .[]' <<<"$inst")
+              [ -n "$types" ] || { echo "没有找到实例"; exit 0; }
+              # shellcheck disable=SC2086
+              gpu=$(aws ec2 describe-instance-types --instance-types $types \
+                --query 'InstanceTypes[?GpuInfo].{t:InstanceType,c:GpuInfo.Gpus[0].Count,n:GpuInfo.Gpus[0].Name}' --output json)
+              jq -r --argjson gpu "$gpu" --arg vpc "$my_vpc" '
+                def tag($k): ([(.Tags // [])[] | select(.Key == $k) | .Value][0] // "-")
+                  | gsub("[\u0001-\u001f\u007f]"; "");   # 去掉控制字符，避免恶意标签注入终端控制码
+                ($gpu | map({key: .t, value: "\(.c)x \(.n)"}) | from_entries) as $g
+                | ["Project", "Role", "Node", "InstanceId", "Type", "GPU", "AZ", "PrivateIp", "Key", "State", "登录方式"],
+                  ( .[] | select($g[.InstanceType] != null)
+                    | [tag("Project"), tag("Role"), tag("Node"), .InstanceId, .InstanceType, $g[.InstanceType],
+                       .Placement.AvailabilityZone, (.PrivateIpAddress // "-"), (.KeyName // "-"), .State.Name,
+                       (if .VpcId == $vpc then (if .KeyName then "SSH / SSM" else "SSM (未挂 key)" end) else "SSM (不同 VPC)" end)] )
+                | @tsv' <<<"$inst" | column -t -s "$(printf '\t')"
+              echo
+              echo "跳板机 VPC: $my_vpc   项目: $LLM_PROJECT   (gpu-list --all 查看全部)"
+              __SCRIPT__
+              cat >/usr/local/bin/vllm-key <<'__SCRIPT__'
+              #!/bin/bash
+              # 输出 vLLM API Key，例如: curl -H "Authorization: Bearer $(vllm-key)" http://<PrivateIp>:8000/v1/models
+              aws secretsmanager get-secret-value --secret-id "$API_KEY_SECRET_ARN" --query SecretString --output text
+              __SCRIPT__
+              chmod 755 /usr/local/bin/gpu-list /usr/local/bin/vllm-key
+              if command -v jq >/dev/null && session-manager-plugin --version >/dev/null 2>&1; then
+                echo "bastion ready"
+              else
+                echo "ERROR: jq / session-manager-plugin 安装失败，请查看 /var/log/bastion-userdata.log"
+                exit 1
+              fi
+            # session-manager-plugin 下载路径随架构
+            - SsmPluginPath: !If [IsArm, linux_arm64, linux_64bit]
 
   BastionInstance:
     Type: AWS::EC2::Instance

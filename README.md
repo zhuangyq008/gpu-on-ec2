@@ -215,9 +215,11 @@ SSH_ALLOWED_CIDRS="203.0.113.10/32" ./deploy-bastion.sh
   - **已有的 GPU 实例**：之前创建、没有挂载 key 的实例只能走 SSM；如果需要 SSH，执行 `./launch-instance.sh --replace` 重建。
 - **S3**：可以读写模型 bucket，以及 `OPS_EXTRA_BUCKETS` 中列出的 bucket（空格分隔）。
 - **内置命令**：
-  - `gpu-list`：列出 GPU 实例及其私网 IP。
+  - `gpu-list`：列出本项目的 GPU 机器，包括 vLLM 实例（`Role=vllm`）和 `gpu-node.sh` 创建的机器（`Role=gpu-node`），以及它们的私网 IP。加 `--all` 可以查看本 Region 所有项目的机器。
   - `vllm-key`：输出 API Key，例如 `curl -H "Authorization: Bearer $(vllm-key)" http://<GPU私网IP>:8000/v1/models`。
   - 环境变量 `$MODEL_BUCKET` 已预先设置好。
+- **机型**：`BASTION_INSTANCE_TYPE` 留空时会弹出菜单，分 x86_64 和 arm64 两组列出推荐机型，并附上实时按需价格和适用场景。默认 `t3.small`；ARM 推荐 `t4g.small`，同等规格大约便宜 20%。也可以手动输入其他机型。脚本会按架构自动选择 AL2023 AMI 和 session-manager-plugin。**更换机型或修改 user-data 会替换跳板机实例**：EIP 不变，但跳板机上的本地文件会丢失，SSH host key 也会变化。
+- **跳板机按项目划分**：每个项目（`PROJECT_NAME`）有自己的跳板机，`gpu-list` 默认只列本项目的机器。只有和跳板机在同一个 VPC 的机器才能 SSH 登录；其他 VPC 的机器请用 SSM。在跳板机**之后**创建的 GPU 机器才会自动放行来自跳板机的 SSH。
 - **修改配置**：修改 `SSH_ALLOWED_CIDRS` 或 `OPS_EXTRA_BUCKETS` 后，重新执行 `./deploy-bastion.sh` 即可。执行 `destroy.sh` 时会先删除跳板机栈。
 
 ## 裸 GPU 机器（OCR / Embedding 等自定义模型）
