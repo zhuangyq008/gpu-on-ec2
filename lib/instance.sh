@@ -4,6 +4,11 @@
 
 INSTANCE_ROLE_TAG="vllm"
 
+# 启动参数 (LAUNCH_*): 默认用于 vLLM 实例，gpu-node.sh 会覆盖为裸 GPU 机器的值
+#   LAUNCH_SUBNET_IDS      候选子网 (逗号分隔)，默认网络栈的私有子网
+#   LAUNCH_PREFERRED_SUBNET 优先尝试的子网 (用户选择的子网)
+#   LAUNCH_SG_IDS / LAUNCH_PROFILE / LAUNCH_ROLE_TAG / LAUNCH_NAME / LAUNCH_EXTRA_TAGS
+#   LAUNCH_HOP_LIMIT / LAUNCH_ROOT_GB / LAUNCH_PUBLIC_IP / LAUNCH_USER_DATA_FN
 # 读取两个栈的输出到全局变量
 load_stack_outputs() {
   stack_ready "$NETWORK_STACK" || die "网络栈 $NETWORK_STACK 未就绪 ($(stack_status "$NETWORK_STACK"))，请先运行 ./deploy.sh"
@@ -54,13 +59,16 @@ ordered_subnets_for_type() {
   offered="$(jq -r --arg t "$itype" '.[] | select(.type == $t) | .azs[]' <<<"$GPU_CATALOG_JSON")"
   scores="$(get_capacity_scores "$itype")"
   [[ -n "$scores" ]] || scores='{}' 
-  local subnet_ids
-  IFS=',' read -ra subnet_ids <<<"$PRIVATE_SUBNET_IDS"
+  local subnet_ids preferred="${LAUNCH_PREFERRED_SUBNET:-}"
+  IFS=',' read -ra subnet_ids <<<"${LAUNCH_SUBNET_IDS:-$PRIVATE_SUBNET_IDS}"
   aws ec2 describe-subnets --subnet-ids "${subnet_ids[@]}" \
     --query 'Subnets[].[SubnetId,AvailabilityZone]' --output text \
   | while read -r sid az; do
       grep -qx "$az" <<<"$offered" || continue
-      printf '%s %s %s\n' "$(jq -r --arg a "$az" '.[$a] // 0' <<<"$scores" 2>/dev/null || echo 0)" "$sid" "$az"
+      local score
+      score="$(jq -r --arg a "$az" '.[$a] // 0' <<<"$scores" 2>/dev/null || echo 0)"
+      [[ "$sid" == "$preferred" ]] && score=100   # 用户选择的子网最先尝试
+      printf '%s %s %s\n' "$score" "$sid" "$az"
     done | sort -rn | awk '{print $2, $3}'
 }
 
@@ -75,18 +83,25 @@ existing_instances() {
 try_run_instance() {
   local itype="$1" subnet="$2" udfile="$3" root_dev out rc=0
   root_dev="$(aws ec2 describe-images --image-ids "$AMI_ID" --query 'Images[0].RootDeviceName' --output text)"
+  local name="${LAUNCH_NAME:-$PROJECT_NAME-vllm}" extra_tags="${LAUNCH_EXTRA_TAGS-{Key=Model,Value=$MODEL_ID\}}"
+  local sgs=()
+  read -ra sgs <<<"${LAUNCH_SG_IDS:-$INSTANCE_SG_ID}"
   local args=(
-    --image-id "$AMI_ID" --instance-type "$itype" --subnet-id "$subnet"
-    --security-group-ids "$INSTANCE_SG_ID"
-    --iam-instance-profile "Name=$INSTANCE_PROFILE_NAME"
-    --metadata-options "HttpTokens=required,HttpPutResponseHopLimit=1,HttpEndpoint=enabled"
-    --block-device-mappings "DeviceName=$root_dev,Ebs={VolumeSize=$ROOT_VOLUME_GB,VolumeType=gp3,Encrypted=true,DeleteOnTermination=true}"
+    --image-id "$AMI_ID" --instance-type "$itype"
+    --iam-instance-profile "Name=${LAUNCH_PROFILE:-$INSTANCE_PROFILE_NAME}"
+    --metadata-options "HttpTokens=required,HttpPutResponseHopLimit=${LAUNCH_HOP_LIMIT:-1},HttpEndpoint=enabled"
+    --block-device-mappings "DeviceName=$root_dev,Ebs={VolumeSize=${LAUNCH_ROOT_GB:-$ROOT_VOLUME_GB},VolumeType=gp3,Encrypted=true,DeleteOnTermination=true}"
     --user-data "fileb://$udfile"
     --tag-specifications
-      "ResourceType=instance,Tags=[{Key=Name,Value=$PROJECT_NAME-vllm},{Key=Project,Value=$PROJECT_NAME},{Key=Role,Value=$INSTANCE_ROLE_TAG},{Key=Model,Value=$MODEL_ID}]"
-      "ResourceType=volume,Tags=[{Key=Name,Value=$PROJECT_NAME-vllm-root},{Key=Project,Value=$PROJECT_NAME}]"
+      "ResourceType=instance,Tags=[{Key=Name,Value=$name},{Key=Project,Value=$PROJECT_NAME},{Key=Role,Value=${LAUNCH_ROLE_TAG:-$INSTANCE_ROLE_TAG}}${extra_tags:+,$extra_tags}]"
+      "ResourceType=volume,Tags=[{Key=Name,Value=$name-root},{Key=Project,Value=$PROJECT_NAME}]"
     --count 1 --query 'Instances[0].InstanceId' --output text
   )
+  if [[ "${LAUNCH_PUBLIC_IP:-0}" == "1" ]]; then
+    args+=(--network-interfaces "DeviceIndex=0,SubnetId=$subnet,AssociatePublicIpAddress=true,Groups=$(IFS=,; echo "${sgs[*]}")")
+  else
+    args+=(--subnet-id "$subnet" --security-group-ids "${sgs[@]}")
+  fi
   [[ -n "${GPU_KEY_NAME:-}" ]] && args+=(--key-name "$GPU_KEY_NAME")
   [[ -n "$CAPACITY_RESERVATION_ID" ]] && \
     args+=(--capacity-reservation-specification "CapacityReservationTarget={CapacityReservationId=$CAPACITY_RESERVATION_ID}")
@@ -114,7 +129,7 @@ try_run_instance() {
 launch_with_fallback() {
   USER_DATA_FILE="$(mktemp)"
   trap 'rm -f "$USER_DATA_FILE"' EXIT
-  render_user_data "$USER_DATA_FILE"
+  "${LAUNCH_USER_DATA_FN:-render_user_data}" "$USER_DATA_FILE"
   GPU_KEY_NAME="$(gpu_key_name)"
   if [[ -n "$GPU_KEY_NAME" ]]; then
     log "GPU 实例挂载 SSH key: $GPU_KEY_NAME (可经跳板机 ssh -J 登录)"

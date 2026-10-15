@@ -57,15 +57,18 @@ S3 已有 _LLM_COMPLETE ──是──▶ aws s3 sync S3 → NVMe（走 Gateway
 ├── launch-instance.sh    # 单独创建或替换 GPU 实例 (换机型 / AMI / 模型)
 ├── status.sh             # 查看状态，--test 做冒烟测试
 ├── deploy-bastion.sh     # 创建/更新运维跳板机 (SSH + SSM，可访问 GPU 实例和 S3)
+├── gpu-node.sh           # 独立创建/列出/删除裸 GPU 机器 (不部署模型，供 OCR / Embedding 等使用)
 ├── destroy.sh            # 销毁全部资源 (S3 bucket、运维 key pair 保留)
 ├── cfn/
 │   ├── network.yaml      # VPC / Subnets / IGW / NAT / S3 Endpoint
 │   ├── inference.yaml    # NLB / SG / IAM / Secret / S3 / Logs
-│   └── bastion.yaml      # 运维跳板机 / EIP / SG 规则 / IAM
+│   ├── bastion.yaml      # 运维跳板机 / EIP / SG 规则 / IAM
+│   └── gpu-node.yaml     # 裸 GPU 机器的 IAM / SG / 可选 NLB
 ├── instance/             # 通过 user-data 下发到 EC2
 │   ├── prepare.sh        # NVMe RAID0 + 权重准备
 │   ├── run-vllm.sh       # docker run vLLM
-│   └── setup.sh          # 安装 systemd unit
+│   ├── setup.sh          # 安装 systemd unit
+│   └── node-init.sh      # 裸 GPU 机器初始化 (NVMe RAID0 / Docker data-root)
 └── lib/                  # 部署端公共函数
 ```
 
@@ -216,6 +219,29 @@ SSH_ALLOWED_CIDRS="203.0.113.10/32" ./deploy-bastion.sh
   - `vllm-key`：输出 API Key，例如 `curl -H "Authorization: Bearer $(vllm-key)" http://<GPU私网IP>:8000/v1/models`。
   - 环境变量 `$MODEL_BUCKET` 已预先设置好。
 - **修改配置**：修改 `SSH_ALLOWED_CIDRS` 或 `OPS_EXTRA_BUCKETS` 后，重新执行 `./deploy-bastion.sh` 即可。执行 `destroy.sh` 时会先删除跳板机栈。
+
+## 裸 GPU 机器（OCR / Embedding 等自定义模型）
+
+`gpu-node.sh` 只负责启动 GPU 机器，**不部署任何模型**，客户在机器上自行用 Docker 部署 OCR、Embedding 等服务。
+
+```bash
+./gpu-node.sh create --name ocr                       # 交互式: 机型 → DLAMI → 子网 (默认私有子网)
+NODE_SERVICE_PORTS="8001 8002" ./gpu-node.sh create --name embedding --with-nlb   # 对外暴露端口
+./gpu-node.sh list                                    # 列出所有节点
+./gpu-node.sh delete --name ocr                       # 终止机器，并删除它的 IAM / SG / NLB
+```
+
+| 项目 | 说明 |
+|---|---|
+| 子网选择 | 列出账号里的所有子网，本项目 VPC 排在最前。根据路由表自动判断公有 / 私有，并标出每个 AZ 是否有所选机型。**默认选第一个"私有 + 机型可用"的子网**。也可以用 `NODE_SUBNET_ID` 直接指定 |
+| 容量回退 | 所选子网没有容量时，自动尝试同 VPC 其他 AZ 的同类型子网（`NODE_SUBNET_FALLBACK=0` 可关闭） |
+| IAM Role | `AmazonSSMManagedInstanceCore`、`AmazonEC2ContainerRegistryReadOnly`（拉取 ECR 镜像），以及 `NODE_S3_BUCKETS` 中 bucket 的读写权限（留空时默认为模型 bucket） |
+| 安全组 | `NODE_SERVICE_PORTS`（最多 5 个）只对 VPC 内网开放；同 VPC 内有跳板机时放行 SSH；出站不限制 |
+| NLB（可选） | 加 `--with-nlb` 时，为该机器单独创建一个 internet-facing NLB，每个端口一个 TCP listener，健康检查用 TCP（服务开始监听后才会变为 healthy），来源限定为 `NODE_ALLOWED_CIDRS`。**流量是 TCP 明文透传，鉴权需要由服务自己实现** |
+| 初始化 | 实例存储 NVMe 组 RAID0，挂载到 `/mnt/nvme`；Docker 数据目录迁到 `/mnt/nvme/docker`（`NODE_DOCKER_ON_NVME=0` 可关闭）；挂载运维 SSH key。每次开机都会在 Docker 启动之前执行 |
+| IMDS | hop limit 默认是 2，容器内可以用实例角色访问 S3 / ECR。如果容器不需要访问 AWS，建议设 `NODE_IMDS_HOP_LIMIT=1` |
+
+> ⚠️ stop/start 之后实例存储会被清空，NVMe 会自动重建，但 `/mnt/nvme` 上的数据和 Docker 镜像都需要重新准备。需要持久保存的数据请放到 S3。
 
 ## GPU 容量获取建议
 

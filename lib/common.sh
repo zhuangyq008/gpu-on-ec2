@@ -74,6 +74,23 @@ validate_config() {
   for b in $OPS_EXTRA_BUCKETS; do
     [[ "$b" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]] || die "OPS_EXTRA_BUCKETS 中的 bucket 名无效: '$b'"
   done
+  for b in $NODE_S3_BUCKETS; do
+    [[ "$b" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]] || die "NODE_S3_BUCKETS 中的 bucket 名无效: '$b'"
+  done
+  local p nports=0 seen=" "
+  for p in $NODE_SERVICE_PORTS; do
+    # shellcheck disable=SC2015
+    [[ "$p" =~ ^[1-9][0-9]{0,4}$ ]] && (( p <= 65535 && p != 22 )) \
+      || die "NODE_SERVICE_PORTS 中的端口无效: '$p' (1-65535，不能是 22，不能有前导零)"
+    [[ "$seen" != *" $p "* ]] || die "NODE_SERVICE_PORTS 中端口重复: $p"
+    seen+="$p "; nports=$((nports + 1))
+  done
+  (( nports <= 5 )) || die "NODE_SERVICE_PORTS 最多 5 个"
+  # shellcheck disable=SC2015
+  [[ "$NODE_ROOT_VOLUME_GB" =~ ^[0-9]+$ ]] && (( NODE_ROOT_VOLUME_GB >= 100 )) || die "NODE_ROOT_VOLUME_GB 至少 100"
+  [[ "$NODE_IMDS_HOP_LIMIT" =~ ^[12]$ ]] || die "NODE_IMDS_HOP_LIMIT 只能是 1 或 2"
+  [[ "$NODE_DOCKER_ON_NVME" =~ ^[01]$ && "$NODE_SUBNET_FALLBACK" =~ ^[01]$ ]] \
+    || die "NODE_DOCKER_ON_NVME / NODE_SUBNET_FALLBACK 只能是 0 或 1"
   [[ "$CAPACITY_RETRY_ROUNDS" =~ ^[1-9][0-9]*$ && "$CAPACITY_RETRY_INTERVAL_SEC" =~ ^[0-9]+$ ]] \
     || die "CAPACITY_RETRY_ROUNDS / CAPACITY_RETRY_INTERVAL_SEC 必须是整数"
   [[ -z "$MODEL_BUCKET" || "$MODEL_BUCKET" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]] \
@@ -157,6 +174,20 @@ wait_stack_settled() {
     status="$(stack_status "$stack")"
     [[ "$status" == *_IN_PROGRESS ]] || { printf '%s' "$status"; return; }
     log "栈 $stack 当前状态 $status，等待完成..."
+    sleep 20
+  done
+}
+
+# GPU 实例终止常超过 10 分钟 (CLI waiter 的默认上限)，这里自行轮询，最长 30 分钟
+wait_terminated() {
+  local start left
+  start="$(date +%s)"
+  log "等待实例终止: $* (GPU 实例通常需要 5-15 分钟)"
+  while true; do
+    left="$(aws ec2 describe-instances --instance-ids "$@" \
+      --query "Reservations[].Instances[?State.Name!='terminated'].InstanceId" --output text)"
+    [[ -z "$left" ]] && return 0
+    (( $(date +%s) - start < 1800 )) || die "等待超时，仍未终止: $left (稍后重新执行)"
     sleep 20
   done
 }

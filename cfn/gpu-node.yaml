@@ -1,0 +1,777 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  GPU-on-EC2 裸 GPU 机器 (不部署模型): IAM Role (SSM + 指定 S3 bucket 读写 + ECR 只读)、
+  Security Group (服务端口仅 VPC 内 / 跳板机 SSH)，可选独立 internet-facing NLB (每端口一个 TCP listener)。
+  GPU 实例由 gpu-node.sh 按 AZ 容量自动选择后创建并注册。
+
+Parameters:
+  ProjectName:
+    Type: String
+    AllowedPattern: "^[a-z][a-z0-9-]{1,20}$"
+  NodeName:
+    Type: String
+    AllowedPattern: "^[a-z][a-z0-9-]{1,15}$"
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  VpcCidr:
+    Type: String
+    AllowedPattern: "^(\\d{1,3}\\.){3}\\d{1,3}/\\d{1,2}$"
+  BastionSecurityGroupId:
+    Type: String
+    Default: ""
+    Description: 同 VPC 的运维跳板机 SG (可空)
+  S3BucketArns:
+    Type: CommaDelimitedList
+  S3ObjectArns:
+    Type: CommaDelimitedList
+  EnableNlb:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+  NlbSubnetIds:
+    Type: CommaDelimitedList
+    Description: NLB 使用的公有子网 (EnableNlb=false 时不使用，可传任意子网 ID)
+  NlbPortMin:
+    Type: Number
+    Default: 1
+  NlbPortMax:
+    Type: Number
+    Default: 65535
+  ServicePort1:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^[0-9]{1,5}$"
+  ServicePort2:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^[0-9]{1,5}$"
+  ServicePort3:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^[0-9]{1,5}$"
+  ServicePort4:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^[0-9]{1,5}$"
+  ServicePort5:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^[0-9]{1,5}$"
+  NodeCidr1:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^(\\d{1,3}\\.){3}\\d{1,3}/\\d{1,2}$"
+  NodeCidr2:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^(\\d{1,3}\\.){3}\\d{1,3}/\\d{1,2}$"
+  NodeCidr3:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^(\\d{1,3}\\.){3}\\d{1,3}/\\d{1,2}$"
+  NodeCidr4:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^(\\d{1,3}\\.){3}\\d{1,3}/\\d{1,2}$"
+  NodeCidr5:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^(\\d{1,3}\\.){3}\\d{1,3}/\\d{1,2}$"
+
+Conditions:
+  DoNlb: !Equals [!Ref EnableNlb, "true"]
+  HasBastion: !Not [!Equals [!Ref BastionSecurityGroupId, ""]]
+  HasPort1: !Not [!Equals [!Ref ServicePort1, ""]]
+  NlbPort1: !And [!Condition DoNlb, !Condition HasPort1]
+  HasPort2: !Not [!Equals [!Ref ServicePort2, ""]]
+  NlbPort2: !And [!Condition DoNlb, !Condition HasPort2]
+  HasPort3: !Not [!Equals [!Ref ServicePort3, ""]]
+  NlbPort3: !And [!Condition DoNlb, !Condition HasPort3]
+  HasPort4: !Not [!Equals [!Ref ServicePort4, ""]]
+  NlbPort4: !And [!Condition DoNlb, !Condition HasPort4]
+  HasPort5: !Not [!Equals [!Ref ServicePort5, ""]]
+  NlbPort5: !And [!Condition DoNlb, !Condition HasPort5]
+  HasNodeCidr1: !Not [!Equals [!Ref NodeCidr1, ""]]
+  NlbCidr1: !And [!Condition DoNlb, !Condition HasNodeCidr1]
+  HasNodeCidr2: !Not [!Equals [!Ref NodeCidr2, ""]]
+  NlbCidr2: !And [!Condition DoNlb, !Condition HasNodeCidr2]
+  HasNodeCidr3: !Not [!Equals [!Ref NodeCidr3, ""]]
+  NlbCidr3: !And [!Condition DoNlb, !Condition HasNodeCidr3]
+  HasNodeCidr4: !Not [!Equals [!Ref NodeCidr4, ""]]
+  NlbCidr4: !And [!Condition DoNlb, !Condition HasNodeCidr4]
+  HasNodeCidr5: !Not [!Equals [!Ref NodeCidr5, ""]]
+  NlbCidr5: !And [!Condition DoNlb, !Condition HasNodeCidr5]
+  NlbCidr1Port1: !And [!Condition NlbCidr1, !Condition HasPort1]
+  NlbCidr1Port2: !And [!Condition NlbCidr1, !Condition HasPort2]
+  NlbCidr1Port3: !And [!Condition NlbCidr1, !Condition HasPort3]
+  NlbCidr1Port4: !And [!Condition NlbCidr1, !Condition HasPort4]
+  NlbCidr1Port5: !And [!Condition NlbCidr1, !Condition HasPort5]
+  NlbCidr2Port1: !And [!Condition NlbCidr2, !Condition HasPort1]
+  NlbCidr2Port2: !And [!Condition NlbCidr2, !Condition HasPort2]
+  NlbCidr2Port3: !And [!Condition NlbCidr2, !Condition HasPort3]
+  NlbCidr2Port4: !And [!Condition NlbCidr2, !Condition HasPort4]
+  NlbCidr2Port5: !And [!Condition NlbCidr2, !Condition HasPort5]
+  NlbCidr3Port1: !And [!Condition NlbCidr3, !Condition HasPort1]
+  NlbCidr3Port2: !And [!Condition NlbCidr3, !Condition HasPort2]
+  NlbCidr3Port3: !And [!Condition NlbCidr3, !Condition HasPort3]
+  NlbCidr3Port4: !And [!Condition NlbCidr3, !Condition HasPort4]
+  NlbCidr3Port5: !And [!Condition NlbCidr3, !Condition HasPort5]
+  NlbCidr4Port1: !And [!Condition NlbCidr4, !Condition HasPort1]
+  NlbCidr4Port2: !And [!Condition NlbCidr4, !Condition HasPort2]
+  NlbCidr4Port3: !And [!Condition NlbCidr4, !Condition HasPort3]
+  NlbCidr4Port4: !And [!Condition NlbCidr4, !Condition HasPort4]
+  NlbCidr4Port5: !And [!Condition NlbCidr4, !Condition HasPort5]
+  NlbCidr5Port1: !And [!Condition NlbCidr5, !Condition HasPort1]
+  NlbCidr5Port2: !And [!Condition NlbCidr5, !Condition HasPort2]
+  NlbCidr5Port3: !And [!Condition NlbCidr5, !Condition HasPort3]
+  NlbCidr5Port4: !And [!Condition NlbCidr5, !Condition HasPort4]
+  NlbCidr5Port5: !And [!Condition NlbCidr5, !Condition HasPort5]
+
+Resources:
+  NodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-node-${NodeName}-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: !Sub "ec2.${AWS::URLSuffix}" }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
+        # 拉取客户私有 ECR 中的 OCR / Embedding 等镜像
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+      Policies:
+        - PolicyName: s3-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ListBuckets
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource: !Ref S3BucketArns
+              - Sid: ReadWriteObjects
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:AbortMultipartUpload
+                  - s3:ListMultipartUploadParts
+                Resource: !Ref S3ObjectArns
+
+  NodeInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${ProjectName}-node-${NodeName}-${AWS::Region}"
+      Roles: [!Ref NodeRole]
+
+  NodeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${ProjectName} GPU node ${NodeName}"
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: model download / image pull / AWS APIs
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-node-${NodeName}-sg" }
+
+  BastionSshIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasBastion
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      SourceSecurityGroupId: !Ref BastionSecurityGroupId
+      Description: SSH from ops bastion
+
+  NlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: DoNlb
+    Properties:
+      GroupDescription: !Sub "${ProjectName} node ${NodeName} NLB"
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: !Ref NlbPortMin
+          ToPort: !Ref NlbPortMax
+          CidrIp: !Ref VpcCidr
+          Description: to GPU node
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-node-${NodeName}-nlb-sg" }
+
+  Nlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Condition: DoNlb
+    Properties:
+      # 名称由 AWS 生成 (NLB 名称上限 32 字符)，用 Name 标签标识
+      Type: network
+      Scheme: internet-facing
+      Subnets: !Ref NlbSubnetIds
+      SecurityGroups: [!Ref NlbSecurityGroup]
+      LoadBalancerAttributes:
+        - Key: load_balancing.cross_zone.enabled
+          Value: "true"
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-node-${NodeName}" }
+
+  VpcPort1Ingress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasPort1
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ServicePort1
+      ToPort: !Ref ServicePort1
+      CidrIp: !Ref VpcCidr
+      Description: service port from VPC
+
+  NlbPort1Ingress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: NlbPort1
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ServicePort1
+      ToPort: !Ref ServicePort1
+      SourceSecurityGroupId: !Ref NlbSecurityGroup
+      Description: service port from node NLB (traffic + health check)
+
+  TargetGroup1:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: NlbPort1
+    Properties:
+      VpcId: !Ref VpcId
+      Protocol: TCP
+      Port: !Ref ServicePort1
+      TargetType: instance
+      HealthCheckProtocol: TCP
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 3
+      UnhealthyThresholdCount: 3
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "60"
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-${NodeName}-${ServicePort1}" }
+
+  Listener1:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: NlbPort1
+    Properties:
+      LoadBalancerArn: !Ref Nlb
+      Protocol: TCP
+      Port: !Ref ServicePort1
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup1
+
+  VpcPort2Ingress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasPort2
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ServicePort2
+      ToPort: !Ref ServicePort2
+      CidrIp: !Ref VpcCidr
+      Description: service port from VPC
+
+  NlbPort2Ingress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: NlbPort2
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ServicePort2
+      ToPort: !Ref ServicePort2
+      SourceSecurityGroupId: !Ref NlbSecurityGroup
+      Description: service port from node NLB (traffic + health check)
+
+  TargetGroup2:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: NlbPort2
+    Properties:
+      VpcId: !Ref VpcId
+      Protocol: TCP
+      Port: !Ref ServicePort2
+      TargetType: instance
+      HealthCheckProtocol: TCP
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 3
+      UnhealthyThresholdCount: 3
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "60"
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-${NodeName}-${ServicePort2}" }
+
+  Listener2:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: NlbPort2
+    Properties:
+      LoadBalancerArn: !Ref Nlb
+      Protocol: TCP
+      Port: !Ref ServicePort2
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup2
+
+  VpcPort3Ingress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasPort3
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ServicePort3
+      ToPort: !Ref ServicePort3
+      CidrIp: !Ref VpcCidr
+      Description: service port from VPC
+
+  NlbPort3Ingress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: NlbPort3
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ServicePort3
+      ToPort: !Ref ServicePort3
+      SourceSecurityGroupId: !Ref NlbSecurityGroup
+      Description: service port from node NLB (traffic + health check)
+
+  TargetGroup3:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: NlbPort3
+    Properties:
+      VpcId: !Ref VpcId
+      Protocol: TCP
+      Port: !Ref ServicePort3
+      TargetType: instance
+      HealthCheckProtocol: TCP
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 3
+      UnhealthyThresholdCount: 3
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "60"
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-${NodeName}-${ServicePort3}" }
+
+  Listener3:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: NlbPort3
+    Properties:
+      LoadBalancerArn: !Ref Nlb
+      Protocol: TCP
+      Port: !Ref ServicePort3
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup3
+
+  VpcPort4Ingress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasPort4
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ServicePort4
+      ToPort: !Ref ServicePort4
+      CidrIp: !Ref VpcCidr
+      Description: service port from VPC
+
+  NlbPort4Ingress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: NlbPort4
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ServicePort4
+      ToPort: !Ref ServicePort4
+      SourceSecurityGroupId: !Ref NlbSecurityGroup
+      Description: service port from node NLB (traffic + health check)
+
+  TargetGroup4:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: NlbPort4
+    Properties:
+      VpcId: !Ref VpcId
+      Protocol: TCP
+      Port: !Ref ServicePort4
+      TargetType: instance
+      HealthCheckProtocol: TCP
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 3
+      UnhealthyThresholdCount: 3
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "60"
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-${NodeName}-${ServicePort4}" }
+
+  Listener4:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: NlbPort4
+    Properties:
+      LoadBalancerArn: !Ref Nlb
+      Protocol: TCP
+      Port: !Ref ServicePort4
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup4
+
+  VpcPort5Ingress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasPort5
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ServicePort5
+      ToPort: !Ref ServicePort5
+      CidrIp: !Ref VpcCidr
+      Description: service port from VPC
+
+  NlbPort5Ingress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: NlbPort5
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ServicePort5
+      ToPort: !Ref ServicePort5
+      SourceSecurityGroupId: !Ref NlbSecurityGroup
+      Description: service port from node NLB (traffic + health check)
+
+  TargetGroup5:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: NlbPort5
+    Properties:
+      VpcId: !Ref VpcId
+      Protocol: TCP
+      Port: !Ref ServicePort5
+      TargetType: instance
+      HealthCheckProtocol: TCP
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 3
+      UnhealthyThresholdCount: 3
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "60"
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-${NodeName}-${ServicePort5}" }
+
+  Listener5:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: NlbPort5
+    Properties:
+      LoadBalancerArn: !Ref Nlb
+      Protocol: TCP
+      Port: !Ref ServicePort5
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup5
+
+  NlbCidr1Port1Ingress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: NlbCidr1Port1
+    Properties:
+      GroupId: !Ref NlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ServicePort1
+      ToPort: !Ref ServicePort1
+      CidrIp: !Ref NodeCidr1
+      Description: allowed client
+
+  NlbCidr1Port2Ingress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: NlbCidr1Port2
+    Properties:
+      GroupId: !Ref NlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ServicePort2
+      ToPort: !Ref ServicePort2
+      CidrIp: !Ref NodeCidr1
+      Description: allowed client
+
+  NlbCidr1Port3Ingress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: NlbCidr1Port3
+    Properties:
+      GroupId: !Ref NlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ServicePort3
+      ToPort: !Ref ServicePort3
+      CidrIp: !Ref NodeCidr1
+      Description: allowed client
+
+  NlbCidr1Port4Ingress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: NlbCidr1Port4
+    Properties:
+      GroupId: !Ref NlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ServicePort4
+      ToPort: !Ref ServicePort4
+      CidrIp: !Ref NodeCidr1
+      Description: allowed client
+
+  NlbCidr1Port5Ingress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: NlbCidr1Port5
+    Properties:
+      GroupId: !Ref NlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ServicePort5
+      ToPort: !Ref ServicePort5
+      CidrIp: !Ref NodeCidr1
+      Description: allowed client
+
+  NlbCidr2Port1Ingress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: NlbCidr2Port1
+    Properties:
+      GroupId: !Ref NlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ServicePort1
+      ToPort: !Ref ServicePort1
+      CidrIp: !Ref NodeCidr2
+      Description: allowed client
+
+  NlbCidr2Port2Ingress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: NlbCidr2Port2
+    Properties:
+      GroupId: !Ref NlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ServicePort2
+      ToPort: !Ref ServicePort2
+      CidrIp: !Ref NodeCidr2
+      Description: allowed client
+
+  NlbCidr2Port3Ingress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: NlbCidr2Port3
+    Properties:
+      GroupId: !Ref NlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ServicePort3
+      ToPort: !Ref ServicePort3
+      CidrIp: !Ref NodeCidr2
+      Description: allowed client
+
+  NlbCidr2Port4Ingress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: NlbCidr2Port4
+    Properties:
+      GroupId: !Ref NlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ServicePort4
+      ToPort: !Ref ServicePort4
+      CidrIp: !Ref NodeCidr2
+      Description: allowed client
+
+  NlbCidr2Port5Ingress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: NlbCidr2Port5
+    Properties:
+      GroupId: !Ref NlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ServicePort5
+      ToPort: !Ref ServicePort5
+      CidrIp: !Ref NodeCidr2
+      Description: allowed client
+
+  NlbCidr3Port1Ingress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: NlbCidr3Port1
+    Properties:
+      GroupId: !Ref NlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ServicePort1
+      ToPort: !Ref ServicePort1
+      CidrIp: !Ref NodeCidr3
+      Description: allowed client
+
+  NlbCidr3Port2Ingress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: NlbCidr3Port2
+    Properties:
+      GroupId: !Ref NlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ServicePort2
+      ToPort: !Ref ServicePort2
+      CidrIp: !Ref NodeCidr3
+      Description: allowed client
+
+  NlbCidr3Port3Ingress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: NlbCidr3Port3
+    Properties:
+      GroupId: !Ref NlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ServicePort3
+      ToPort: !Ref ServicePort3
+      CidrIp: !Ref NodeCidr3
+      Description: allowed client
+
+  NlbCidr3Port4Ingress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: NlbCidr3Port4
+    Properties:
+      GroupId: !Ref NlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ServicePort4
+      ToPort: !Ref ServicePort4
+      CidrIp: !Ref NodeCidr3
+      Description: allowed client
+
+  NlbCidr3Port5Ingress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: NlbCidr3Port5
+    Properties:
+      GroupId: !Ref NlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ServicePort5
+      ToPort: !Ref ServicePort5
+      CidrIp: !Ref NodeCidr3
+      Description: allowed client
+
+  NlbCidr4Port1Ingress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: NlbCidr4Port1
+    Properties:
+      GroupId: !Ref NlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ServicePort1
+      ToPort: !Ref ServicePort1
+      CidrIp: !Ref NodeCidr4
+      Description: allowed client
+
+  NlbCidr4Port2Ingress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: NlbCidr4Port2
+    Properties:
+      GroupId: !Ref NlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ServicePort2
+      ToPort: !Ref ServicePort2
+      CidrIp: !Ref NodeCidr4
+      Description: allowed client
+
+  NlbCidr4Port3Ingress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: NlbCidr4Port3
+    Properties:
+      GroupId: !Ref NlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ServicePort3
+      ToPort: !Ref ServicePort3
+      CidrIp: !Ref NodeCidr4
+      Description: allowed client
+
+  NlbCidr4Port4Ingress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: NlbCidr4Port4
+    Properties:
+      GroupId: !Ref NlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ServicePort4
+      ToPort: !Ref ServicePort4
+      CidrIp: !Ref NodeCidr4
+      Description: allowed client
+
+  NlbCidr4Port5Ingress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: NlbCidr4Port5
+    Properties:
+      GroupId: !Ref NlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ServicePort5
+      ToPort: !Ref ServicePort5
+      CidrIp: !Ref NodeCidr4
+      Description: allowed client
+
+  NlbCidr5Port1Ingress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: NlbCidr5Port1
+    Properties:
+      GroupId: !Ref NlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ServicePort1
+      ToPort: !Ref ServicePort1
+      CidrIp: !Ref NodeCidr5
+      Description: allowed client
+
+  NlbCidr5Port2Ingress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: NlbCidr5Port2
+    Properties:
+      GroupId: !Ref NlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ServicePort2
+      ToPort: !Ref ServicePort2
+      CidrIp: !Ref NodeCidr5
+      Description: allowed client
+
+  NlbCidr5Port3Ingress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: NlbCidr5Port3
+    Properties:
+      GroupId: !Ref NlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ServicePort3
+      ToPort: !Ref ServicePort3
+      CidrIp: !Ref NodeCidr5
+      Description: allowed client
+
+  NlbCidr5Port4Ingress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: NlbCidr5Port4
+    Properties:
+      GroupId: !Ref NlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ServicePort4
+      ToPort: !Ref ServicePort4
+      CidrIp: !Ref NodeCidr5
+      Description: allowed client
+
+  NlbCidr5Port5Ingress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: NlbCidr5Port5
+    Properties:
+      GroupId: !Ref NlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ServicePort5
+      ToPort: !Ref ServicePort5
+      CidrIp: !Ref NodeCidr5
+      Description: allowed client
+
+Outputs:
+  NodeSecurityGroupId:
+    Value: !Ref NodeSecurityGroup
+  InstanceProfileName:
+    Value: !Ref NodeInstanceProfile
+  NlbDnsName:
+    Condition: DoNlb
+    Value: !GetAtt Nlb.DNSName
+  TargetGroup1Arn:
+    Condition: NlbPort1
+    Value: !Ref TargetGroup1
+  TargetGroup2Arn:
+    Condition: NlbPort2
+    Value: !Ref TargetGroup2
+  TargetGroup3Arn:
+    Condition: NlbPort3
+    Value: !Ref TargetGroup3
+  TargetGroup4Arn:
+    Condition: NlbPort4
+    Value: !Ref TargetGroup4
+  TargetGroup5Arn:
+    Condition: NlbPort5
+    Value: !Ref TargetGroup5

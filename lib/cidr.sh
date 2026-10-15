@@ -40,7 +40,11 @@ normalize_cidrs() {
       fi
     elif (( ${c##*/} < 16 )); then
       warn "$c 范围较大 (超过 /16)，请确认是否必要"
-      [[ "$ASSUME_YES" == "1" ]] || confirm "确认使用 $c?" || exit 1
+      if [[ "$ASSUME_YES" == "1" ]]; then
+        [[ "${ALLOW_PUBLIC_CIDR:-0}" == "1" ]] || die "非交互模式下使用 $c 需设置 ALLOW_PUBLIC_CIDR=1"
+      else
+        confirm "确认使用 $c?" || exit 1
+      fi
     fi
   done
   (( ${#uniq[@]} > 0 )) || die "$what 的来源 CIDR 不能为空"

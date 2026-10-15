@@ -15,20 +15,6 @@ delete_stack() {
   ok "已删除 $stack"
 }
 
-# GPU 实例终止常超过 10 分钟 (CLI waiter 的默认上限)，这里自行轮询，最长 30 分钟
-wait_terminated() {
-  local start left
-  start="$(date +%s)"
-  log "等待实例终止: $* (GPU 实例通常需要 5-15 分钟)"
-  while true; do
-    left="$(aws ec2 describe-instances --instance-ids "$@" \
-      --query "Reservations[].Instances[?State.Name!='terminated'].InstanceId" --output text)"
-    [[ -z "$left" ]] && return 0
-    (( $(date +%s) - start < 1800 )) || die "等待超时，仍未终止: $left (稍后重新执行 ./destroy.sh)"
-    sleep 20
-  done
-}
-
 main() {
   parse_common_flags "$@"
   load_config
@@ -36,17 +22,20 @@ main() {
 
   local ids bucket="" secret=""
   ids="$(aws ec2 describe-instances \
-    --filters "Name=tag:Project,Values=$PROJECT_NAME" "Name=tag:Role,Values=vllm" \
+    --filters "Name=tag:Project,Values=$PROJECT_NAME" "Name=tag:Role,Values=vllm,gpu-node" \
               "Name=instance-state-name,Values=pending,running,stopping,stopped,shutting-down" \
     --query 'Reservations[].Instances[].InstanceId' --output text)"
+  local node_stacks
+  node_stacks="$(aws cloudformation describe-stacks \
+    --query "Stacks[?starts_with(StackName,'$PROJECT_NAME-node-')].StackName" --output text)"
   [[ "$(stack_status "$INFERENCE_STACK")" != "NOT_FOUND" ]] && \
     { bucket="$(stack_output "$INFERENCE_STACK" ModelBucketName 2>/dev/null || true)"
       secret="$(stack_output "$INFERENCE_STACK" ApiKeySecretArn 2>/dev/null || true)"; }
 
   cat >&2 <<EOF
 将在 $AWS_REGION 删除:
-  GPU 实例   : ${ids:-无}
-  CFN 栈     : $BASTION_STACK (如存在), $INFERENCE_STACK, $NETWORK_STACK
+  实例       : ${ids:-无} (vLLM + 裸 GPU 机器)
+  CFN 栈     : ${node_stacks:+$node_stacks, }$BASTION_STACK (如存在), $INFERENCE_STACK, $NETWORK_STACK
   保留       : S3 bucket ${bucket:-无} (模型权重)
 EOF
   confirm "确认删除?" || exit 0
@@ -58,7 +47,9 @@ EOF
     wait_terminated $ids
     ok "实例已终止"
   fi
-  # 跳板机栈在 GPU 实例 SG 上添加了规则，必须先于推理栈删除
+  # 删除顺序: 节点栈 (引用跳板机 SG) -> 跳板机栈 (在 vLLM SG 上加了规则) -> 推理栈 -> 网络栈
+  local s
+  for s in $node_stacks; do delete_stack "$s"; done
   delete_stack "$BASTION_STACK"
   delete_stack "$INFERENCE_STACK"
   # CFN 删除 secret 默认进入 30 天恢复期，同名重建会冲突，这里立即彻底删除
