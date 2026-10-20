@@ -75,8 +75,8 @@ validate_config() {
   for b in $OPS_EXTRA_BUCKETS; do
     [[ "$b" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]] || die "OPS_EXTRA_BUCKETS 中的 bucket 名无效: '$b'"
   done
-  for b in $NODE_S3_BUCKETS; do
-    [[ "$b" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]] || die "NODE_S3_BUCKETS 中的 bucket 名无效: '$b'"
+  for b in $GPU_S3_BUCKETS; do
+    [[ "$b" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]] || die "GPU_S3_BUCKETS 中的 bucket 名无效: '$b'"
   done
   local p nports=0 seen=" "
   for p in $NODE_SERVICE_PORTS; do
@@ -210,13 +210,15 @@ deploy_stack() {
     aws cloudformation wait stack-delete-complete --stack-name "$stack"
   fi
   log "部署 CloudFormation 栈 $stack ..."
+  local overrides=()
+  (( $# > 0 )) && overrides=(--parameter-overrides "$@")   # 未指定的参数沿用已部署的值
   if ! aws cloudformation deploy \
       --stack-name "$stack" \
       --template-file "$tpl" \
       --capabilities CAPABILITY_NAMED_IAM \
       --no-fail-on-empty-changeset \
       --tags "Project=$PROJECT_NAME" \
-      --parameter-overrides "$@"; then
+      "${overrides[@]+"${overrides[@]}"}"; then
     DEPLOY_STACK_ERROR="$(aws cloudformation describe-stack-events --stack-name "$stack" --max-items 30 \
       --query "StackEvents[?contains(ResourceStatus,'FAILED')].[LogicalResourceId,ResourceStatusReason]" \
       --output text 2>/dev/null || true)"

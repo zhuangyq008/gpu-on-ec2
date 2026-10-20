@@ -19,30 +19,6 @@ node_instances() {  # node_instances <name> [states]
     --query 'Reservations[].Instances[].InstanceId' --output text
 }
 
-# NODE_S3_BUCKETS 为空时默认本项目模型 bucket -> NODE_BUCKETS / NODE_BUCKET_ARNS / NODE_OBJECT_ARNS
-resolve_node_buckets() {
-  local partition b arns=() objs=()
-  NODE_BUCKETS="$NODE_S3_BUCKETS"
-  if [[ -z "$NODE_BUCKETS" ]] && stack_ready "$INFERENCE_STACK"; then
-    NODE_BUCKETS="$(stack_output "$INFERENCE_STACK" ModelBucketName)"
-  fi
-  if [[ -z "$NODE_BUCKETS" ]]; then
-    [[ "$ASSUME_YES" == "1" ]] && die "请设置 NODE_S3_BUCKETS (IAM Role 需要访问的 bucket)"
-    NODE_BUCKETS="$(prompt_default "IAM Role 需要读写的 S3 bucket (空格分隔)" "")"
-    local bk
-    for bk in $NODE_BUCKETS; do
-      [[ "$bk" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]] || die "bucket 名无效: '$bk'"
-    done
-  fi
-  [[ -n "$NODE_BUCKETS" ]] || die "至少需要一个 S3 bucket"
-  partition="$(aws sts get-caller-identity --query Arn --output text | cut -d: -f2)"
-  for b in $NODE_BUCKETS; do
-    arns+=("arn:$partition:s3:::$b"); objs+=("arn:$partition:s3:::$b/*")
-  done
-  NODE_BUCKET_ARNS="$(IFS=,; echo "${arns[*]}")"
-  NODE_OBJECT_ARNS="$(IFS=,; echo "${objs[*]}")"
-}
-
 # 同 VPC 的跳板机 SG (不同 VPC 不能引用)
 bastion_sg_for_vpc() {
   stack_ready "$BASTION_STACK" || return 0
@@ -58,7 +34,6 @@ node_stack_params() {
   read -ra ports <<<"$NODE_SERVICE_PORTS"
   printf '%s\n' "ProjectName=$PROJECT_NAME" "NodeName=$NODE_NAME" "VpcId=$NODE_VPC_ID" \
     "VpcCidr=$NODE_VPC_CIDR" "BastionSecurityGroupId=$NODE_BASTION_SG" \
-    "S3BucketArns=$NODE_BUCKET_ARNS" "S3ObjectArns=$NODE_OBJECT_ARNS" \
     "EnableNlb=$([[ "$WITH_NLB" == "1" ]] && echo true || echo false)" \
     "NlbSubnetIds=${NODE_NLB_SUBNETS:-$NODE_SUBNET_ID}"
   if [[ "$WITH_NLB" == "1" ]]; then
@@ -70,7 +45,7 @@ node_stack_params() {
 }
 
 render_node_env() {
-  printf 'AWS_REGION=%q\nNODE_NAME=%q\nNODE_DOCKER_ON_NVME=%q\nNODE_S3_BUCKETS=%q\nNODE_SERVICE_PORTS=%q\n' \
+  printf 'AWS_REGION=%q\nNODE_NAME=%q\nNODE_DOCKER_ON_NVME=%q\nGPU_S3_BUCKETS=%q\nNODE_SERVICE_PORTS=%q\n' \
     "$AWS_REGION" "$NODE_NAME" "$NODE_DOCKER_ON_NVME" "$NODE_BUCKETS" "$NODE_SERVICE_PORTS"
 }
 
@@ -129,7 +104,8 @@ configure_node_launch() {
   fi
   [[ -n "$LAUNCH_SUBNET_IDS" ]] || die "没有可用于创建实例的子网 (NLB 模式下实例 AZ 需有公有子网)"
   LAUNCH_SG_IDS="$(stack_output "$NODE_STACK" NodeSecurityGroupId)"
-  LAUNCH_PROFILE="$(stack_output "$NODE_STACK" InstanceProfileName)"
+  # 所有 GPU 机器共用推理栈的 Instance Profile
+  LAUNCH_PROFILE="$(stack_output "$INFERENCE_STACK" InstanceProfileName)"
   LAUNCH_ROLE_TAG="$NODE_ROLE_TAG"
   LAUNCH_NAME="$NODE_STACK"
   LAUNCH_EXTRA_TAGS="{Key=Node,Value=$NODE_NAME}"

@@ -7,6 +7,7 @@ source "$ROOT_DIR/lib/ami.sh"
 source "$ROOT_DIR/lib/instance.sh"
 source "$ROOT_DIR/lib/keypair.sh"
 source "$ROOT_DIR/lib/cidr.sh"
+source "$ROOT_DIR/lib/iam.sh"
 
 usage() {
   cat <<'EOF'
@@ -133,6 +134,7 @@ main() {
  AMI           : $AMI_ID  $AMI_NAME
  Model         : $MODEL_ID@$MODEL_REVISION
  Model Bucket  : $MODEL_BUCKET_NAME (新建: $CREATE_BUCKET)
+ GPU IAM Role  : 所有 GPU 机器共用; 额外 S3: ${GPU_S3_BUCKETS:-保持已部署值}
  vLLM          : $VLLM_IMAGE  max_len=$VLLM_MAX_MODEL_LEN
  NLB           : internet-facing TCP:$LISTENER_PORT  来源: $ALLOWED_CIDRS
 ----------------------------------------------------------------------
@@ -144,14 +146,28 @@ EOF
     "ProjectName=$PROJECT_NAME" "VpcCidr=$VPC_CIDR" "AzA=$AZ_A" "AzB=$AZ_B" "NatMode=$NAT_MODE"
 
   log "==== 4/5 部署推理栈 ===="
-  local cidr_args=()
+  local cidr_args=() bucket_args=()
   mapfile -t cidr_args < <(cidr_slot_params AllowedCidr 10 "$ALLOWED_CIDRS")
+  # GPU_S3_BUCKETS 为空时不传参，保持已部署的 bucket 列表 (含 gpu-node.sh 追加的)
+  if [[ -n "$GPU_S3_BUCKETS" ]]; then
+    local b removed=()
+    for b in $(deployed_gpu_buckets); do [[ " $GPU_S3_BUCKETS " == *" $b "* ]] || removed+=("$b"); done
+    if (( ${#removed[@]} > 0 )); then
+      warn "GPU_S3_BUCKETS 未包含已授权的 bucket: ${removed[*]} —— 所有 GPU 机器将失去对它们的访问"
+      if [[ "$ASSUME_YES" == "1" ]]; then
+        [[ "${ALLOW_BUCKET_REMOVAL:-0}" == "1" ]] || die "非交互模式下移除 bucket 需设置 ALLOW_BUCKET_REMOVAL=1"
+      else
+        confirm "确认移除这些 bucket 权限?" || exit 0
+      fi
+    fi
+    mapfile -t bucket_args < <(gpu_bucket_params "$GPU_S3_BUCKETS")
+  fi
   deploy_stack "$INFERENCE_STACK" "$ROOT_DIR/cfn/inference.yaml" \
     "ProjectName=$PROJECT_NAME" \
     "VpcId=$(stack_output "$NETWORK_STACK" VpcId)" \
     "VpcCidr=$(stack_output "$NETWORK_STACK" VpcCidr)" \
     "PublicSubnetIds=$(stack_output "$NETWORK_STACK" PublicSubnetIds)" \
-    "${cidr_args[@]}" "ListenerPort=$LISTENER_PORT" \
+    "${cidr_args[@]}" "${bucket_args[@]+"${bucket_args[@]}"}" "ListenerPort=$LISTENER_PORT" \
     "ModelBucketName=$MODEL_BUCKET_NAME" "CreateModelBucket=$CREATE_BUCKET" \
     "ModelS3Prefix=$MODEL_S3_PREFIX" "HfTokenSecretArn=$HF_TOKEN_SECRET_ARN"
 

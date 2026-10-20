@@ -1,7 +1,7 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
-  GPU-on-EC2 裸 GPU 机器 (不部署模型): IAM Role (SSM + 指定 S3 bucket 读写 + ECR 只读)、
-  Security Group (服务端口仅 VPC 内 / 跳板机 SSH)，可选独立 internet-facing NLB (每端口一个 TCP listener)。
+  GPU-on-EC2 裸 GPU 机器 (不部署模型): 共用推理栈的 GPU Instance Role / Profile，
+  本栈只含 Security Group (服务端口仅 VPC 内 / 跳板机 SSH)，可选独立 internet-facing NLB (每端口一个 TCP listener)。
   GPU 实例由 gpu-node.sh 按 AZ 容量自动选择后创建并注册。
 
 Parameters:
@@ -20,10 +20,6 @@ Parameters:
     Type: String
     Default: ""
     Description: 同 VPC 的运维跳板机 SG (可空)
-  S3BucketArns:
-    Type: CommaDelimitedList
-  S3ObjectArns:
-    Type: CommaDelimitedList
   EnableNlb:
     Type: String
     AllowedValues: ["true", "false"]
@@ -128,47 +124,6 @@ Conditions:
   NlbCidr5Port5: !And [!Condition NlbCidr5, !Condition HasPort5]
 
 Resources:
-  NodeRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub "${ProjectName}-node-${NodeName}-${AWS::Region}"
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal: { Service: !Sub "ec2.${AWS::URLSuffix}" }
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
-        # 拉取客户私有 ECR 中的 OCR / Embedding 等镜像
-        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
-      Policies:
-        - PolicyName: s3-access
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Sid: ListBuckets
-                Effect: Allow
-                Action:
-                  - s3:ListBucket
-                  - s3:GetBucketLocation
-                Resource: !Ref S3BucketArns
-              - Sid: ReadWriteObjects
-                Effect: Allow
-                Action:
-                  - s3:GetObject
-                  - s3:PutObject
-                  - s3:DeleteObject
-                  - s3:AbortMultipartUpload
-                  - s3:ListMultipartUploadParts
-                Resource: !Ref S3ObjectArns
-
-  NodeInstanceProfile:
-    Type: AWS::IAM::InstanceProfile
-    Properties:
-      InstanceProfileName: !Sub "${ProjectName}-node-${NodeName}-${AWS::Region}"
-      Roles: [!Ref NodeRole]
-
   NodeSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -755,8 +710,6 @@ Resources:
 Outputs:
   NodeSecurityGroupId:
     Value: !Ref NodeSecurityGroup
-  InstanceProfileName:
-    Value: !Ref NodeInstanceProfile
   NlbDnsName:
     Condition: DoNlb
     Value: !GetAtt Nlb.DNSName

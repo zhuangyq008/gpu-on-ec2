@@ -198,6 +198,24 @@ print(resp.choices[0].message.content)
 | 轮换 API Key | 在 Secrets Manager 中更新 secret → `sudo systemctl restart vllm` |
 | 销毁 | `./destroy.sh`（S3 权重保留，下次部署自动复用） |
 
+## 共用 GPU IAM Role
+
+`deploy.sh`、`launch-instance.sh`、`gpu-node.sh` 创建的所有 GPU EC2 共用同一个 Role / Instance Profile：`<project>-gpu-instance-<region>`，由推理栈管理。
+
+| 权限 | 说明 |
+|---|---|
+| `AmazonSSMManagedInstanceCore` | SSM 登录 |
+| `AmazonEC2ContainerRegistryReadOnly` | 拉取 ECR 镜像 |
+| S3 读 / 写 / 删 | 模型 bucket，以及 `GPU_S3_BUCKETS` 中列出的 bucket |
+| Secrets Manager 读取 | vLLM API Key，以及配置了的 HF token |
+| CloudWatch Logs 写入 | vLLM 日志组 |
+
+- `GPU_S3_BUCKETS` 的更新规则：
+  - `deploy.sh`：设置了这个变量时，按设置的值精确更新；留空时保持已部署的值不变。
+  - `gpu-node.sh create`：只追加缺少的 bucket，不会删除已有的。
+- ⚠️ 共用 Role 意味着所有 GPU 机器（包括客户在裸 GPU 机器上运行的容器）权限相同，**都能读取 vLLM API Key**。如果需要隔离，请拆分为不同的 `PROJECT_NAME`。
+- 旧版本脚本创建的 gpu-node 机器使用的是独立 Role，可以用 `./gpu-node.sh migrate-iam --name <节点名>` 热切换到共用 Profile，不需要重启。原来那个 Role 能访问的 bucket 会自动合并进共用 Role。
+
 ## 运维跳板机
 
 ```bash
@@ -237,7 +255,7 @@ NODE_SERVICE_PORTS="8001 8002" ./gpu-node.sh create --name embedding --with-nlb 
 |---|---|
 | 子网选择 | 列出账号里的所有子网，本项目 VPC 排在最前。根据路由表自动判断公有 / 私有，并标出每个 AZ 是否有所选机型。**默认选第一个"私有 + 机型可用"的子网**。也可以用 `NODE_SUBNET_ID` 直接指定 |
 | 容量回退 | 所选子网没有容量时，自动尝试同 VPC 其他 AZ 的同类型子网（`NODE_SUBNET_FALLBACK=0` 可关闭） |
-| IAM Role | `AmazonSSMManagedInstanceCore`、`AmazonEC2ContainerRegistryReadOnly`（拉取 ECR 镜像），以及 `NODE_S3_BUCKETS` 中 bucket 的读写权限（留空时默认为模型 bucket） |
+| IAM Role | **与 vLLM 实例共用**推理栈的 `<project>-gpu-instance-<region>` Role / Instance Profile（见下方"共用 GPU IAM Role"）。因此需要先执行 `./deploy.sh` 或 `./deploy.sh --no-instance` |
 | 安全组 | `NODE_SERVICE_PORTS`（最多 5 个）只对 VPC 内网开放；同 VPC 内有跳板机时放行 SSH；出站不限制 |
 | NLB（可选） | 加 `--with-nlb` 时，为该机器单独创建一个 internet-facing NLB，每个端口一个 TCP listener，健康检查用 TCP（服务开始监听后才会变为 healthy），来源限定为 `NODE_ALLOWED_CIDRS`。**流量是 TCP 明文透传，鉴权需要由服务自己实现** |
 | 初始化 | 实例存储 NVMe 组 RAID0，挂载到 `/mnt/nvme`；Docker 数据目录迁到 `/mnt/nvme/docker`（`NODE_DOCKER_ON_NVME=0` 可关闭）；挂载运维 SSH key。每次开机都会在 Docker 启动之前执行 |
