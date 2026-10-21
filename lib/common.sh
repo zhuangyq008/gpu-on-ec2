@@ -47,8 +47,6 @@ validate_config() {
     || die "PROJECT_NAME 只能包含小写字母/数字/-，以字母开头，长度 2-21: '$PROJECT_NAME'"
   [[ "$AWS_REGION" =~ ^[a-z]{2}(-[a-z]+)+-[0-9]$ ]] || die "AWS_REGION 格式错误: '$AWS_REGION'"
   [[ "$NAT_MODE" == "single" || "$NAT_MODE" == "per-az" ]] || die "NAT_MODE 只能是 single 或 per-az"
-  [[ -z "$DEPLOY_MODE" || "$DEPLOY_MODE" =~ ^(vllm|node|infra)$ ]] \
-    || die "DEPLOY_MODE 只能是 vllm / node / infra (留空为交互选择): '$DEPLOY_MODE'"
   # shellcheck disable=SC2015
   [[ "$LISTENER_PORT" =~ ^[0-9]+$ ]] && (( LISTENER_PORT > 0 && LISTENER_PORT < 65536 )) \
     || die "LISTENER_PORT 无效: '$LISTENER_PORT'"
