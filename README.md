@@ -8,6 +8,7 @@
 - 跨 AZ（以及可选的备选机型）自动重试，抢占 GPU 容量
 - 模型权重：首次从 Hugging Face 下载并存入 **S3**，之后每次启动都从 S3 拉到 **NVMe 实例存储**（RAID0）
 - 用 **Docker 运行 vLLM**（OpenAI 兼容 API），默认模型 `Qwen/Qwen3.5-35B-A3B-FP8`
+- **部署模型是可选的**：`deploy.sh` 开始时选择"GPU + 部署模型"、"只建裸 GPU 机器（不部署模型）"或"只建基础设施"
 - 通过 **internet-facing NLB** 对外提供服务，鉴权方式为 API Key + 来源 CIDR 白名单
 
 ## 架构
@@ -113,17 +114,32 @@ CloudShell 的注意事项：
 # 2. 修改配置，至少设置 ALLOWED_CIDRS (允许访问推理服务的来源 IP)
 vi config.env
 
-# 3. 部署 (交互式选择机型和 AMI)
+# 3. 部署 (交互式选择部署内容、机型和 AMI)
 ./deploy.sh
 
 # 4. 查看状态 + 冒烟测试
 ./status.sh --test
 ```
 
+`deploy.sh` 第一步会询问本次部署内容（`DEPLOY_MODE`）：
+
+| 编号 | 部署内容 | 等价参数 | 说明 |
+|---|---|---|---|
+| 1（默认） | GPU 实例 + 部署模型 `MODEL_ID` | `DEPLOY_MODE=vllm` | 默认 Qwen3.5-35B-A3B-FP8，经 NLB 提供 OpenAI 兼容 API |
+| 2 | 裸 GPU 机器，**不部署模型** | `--no-model` / `DEPLOY_MODE=node` | 部署确认前先询问节点名（非交互模式为 `node1`）、是否为该机器创建对外 NLB（非交互模式用 `--with-nlb`）及其来源 CIDR；栈就绪后自动调用 `./gpu-node.sh create` 选择机型 / AMI / 子网（见"裸 GPU 机器"一节） |
+| 3 | 只部署基础设施 | `--no-instance` / `DEPLOY_MODE=infra` | 只建网络栈与推理栈，之后再用 `./launch-instance.sh` 或 `./gpu-node.sh create` 创建 GPU 机器 |
+
+> 选 2 / 3 时推理栈（NLB、API Key、共用 IAM Role、模型 bucket）照常创建，之后可以随时用 `./launch-instance.sh` 部署模型。
+>
+> 重新执行（例如 CloudShell 超时）：已存在 vLLM 实例且没有指定 `--no-model` / `DEPLOY_MODE` 时不再询问，只更新栈；选择裸 GPU 机器时，如果节点名已有实例，交互模式会要求换名，非交互模式只更新栈。
+
 非交互部署（CI / 批量）：
 
 ```bash
-ALLOWED_CIDRS="203.0.113.10/32" ./deploy.sh --yes
+ALLOWED_CIDRS="203.0.113.10/32" ./deploy.sh --yes                         # GPU + 部署模型
+ALLOWED_CIDRS="203.0.113.10/32" ./deploy.sh --yes --no-model              # 裸 GPU 机器 (节点名 node1)
+ALLOWED_CIDRS="203.0.113.10/32" NODE_ALLOWED_CIDRS="203.0.113.10/32" \
+  ./deploy.sh --yes --no-model --with-nlb                                   # 裸 GPU 机器 + 对外 NLB
 ```
 
 `deploy.sh` 结束时会打印 endpoint 和 API Key 的获取方式。首次启动需要拉取 vLLM 镜像（约 10GB）并从 HF 下载权重（FP8 约 35GB），一般需要 **15–40 分钟**；之后再重建实例时，权重直接从 S3 拉取，速度会快很多。
@@ -159,6 +175,7 @@ print(resp.choices[0].message.content)
 |---|---|---|
 | `TARGET_REGION` | `ap-southeast-5` | 部署 Region（**不要**用 `AWS_REGION` 覆盖） |
 | `PROJECT_NAME` | `gpu-llm` | 资源命名前缀和 Tag |
+| `DEPLOY_MODE` | 空（交互选择；`--yes` 时为 `vllm`） | `deploy.sh` 部署内容：`vllm` = GPU + 部署模型，`node` = 裸 GPU 机器（不部署模型），`infra` = 只建基础设施。命令行 `--add` / `--no-model` / `--no-instance` 优先 |
 | `ALLOWED_CIDRS` | 空（重新执行时沿用已部署的值；非 CloudShell 环境下默认填入本机公网 IP） | NLB 来源白名单，逗号分隔，最多 10 个。在 `--yes` 模式下使用 `/0` 需要同时设置 `ALLOW_PUBLIC_CIDR=1` |
 | `NAT_MODE` | `single` | `per-az` 表示每个 AZ 一个 NAT（高可用） |
 | `INSTANCE_FAMILIES` | `g6` | 列出的 GPU 家族 |
@@ -192,6 +209,7 @@ print(resp.choices[0].message.content)
 | 修改来源白名单 | 修改 `ALLOWED_CIDRS` → `./deploy.sh`（已有实例时只更新栈） |
 | 登录实例 | `aws ssm start-session --target <instance-id>`，或经跳板机 SSH（见"运维跳板机"一节） |
 | 只建基础设施 | `./deploy.sh --no-instance`（之后再用 `./launch-instance.sh` 创建 GPU 实例） |
+| 只要 GPU 机器，不部署模型 | `./deploy.sh --no-model`（或交互选择 2），等同 `./deploy.sh --no-instance` + `./gpu-node.sh create` |
 | 查看启动进度 | 实例上执行 `sudo journalctl -u vllm -f` |
 | vLLM 日志 | CloudWatch Logs `/<project>/vllm`，或在实例上执行 `docker logs -f vllm` |
 | 重启服务 | `sudo systemctl restart vllm` |
@@ -255,7 +273,7 @@ NODE_SERVICE_PORTS="8001 8002" ./gpu-node.sh create --name embedding --with-nlb 
 |---|---|
 | 子网选择 | 列出账号里的所有子网，本项目 VPC 排在最前。根据路由表自动判断公有 / 私有，并标出每个 AZ 是否有所选机型。**默认选第一个"私有 + 机型可用"的子网**。也可以用 `NODE_SUBNET_ID` 直接指定 |
 | 容量回退 | 所选子网没有容量时，自动尝试同 VPC 其他 AZ 的同类型子网（`NODE_SUBNET_FALLBACK=0` 可关闭） |
-| IAM Role | **与 vLLM 实例共用**推理栈的 `<project>-gpu-instance-<region>` Role / Instance Profile（见下方"共用 GPU IAM Role"）。因此需要先执行 `./deploy.sh` 或 `./deploy.sh --no-instance` |
+| IAM Role | **与 vLLM 实例共用**推理栈的 `<project>-gpu-instance-<region>` Role / Instance Profile（见下方"共用 GPU IAM Role"）。因此需要先执行 `./deploy.sh` 或 `./deploy.sh --no-instance`；也可以用 `./deploy.sh --no-model` 一步完成建栈 + 创建裸 GPU 机器 |
 | 安全组 | `NODE_SERVICE_PORTS`（最多 5 个）只对 VPC 内网开放；同 VPC 内有跳板机时放行 SSH；出站不限制 |
 | NLB（可选） | 加 `--with-nlb` 时，为该机器单独创建一个 internet-facing NLB，每个端口一个 TCP listener，健康检查用 TCP（服务开始监听后才会变为 healthy），来源限定为 `NODE_ALLOWED_CIDRS`。**流量是 TCP 明文透传，鉴权需要由服务自己实现** |
 | 初始化 | 实例存储 NVMe 组 RAID0，挂载到 `/mnt/nvme`；Docker 数据目录迁到 `/mnt/nvme/docker`（`NODE_DOCKER_ON_NVME=0` 可关闭）；挂载运维 SSH key。每次开机都会在 Docker 启动之前执行 |
