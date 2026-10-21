@@ -6,11 +6,12 @@
 _partition() { aws sts get-caller-identity --query Arn --output text | cut -d: -f2; }
 
 # 已部署的额外 bucket 名 (空格分隔)
+# 没有额外 bucket 时 grep 无匹配返回 1，在 pipefail 下会让调用方的赋值触发 set -e 静默退出，所以 || true
 deployed_gpu_buckets() {
   stack_ready "$INFERENCE_STACK" || return 0
   aws cloudformation describe-stacks --stack-name "$INFERENCE_STACK" \
     --query "Stacks[0].Parameters[?ParameterKey=='GpuS3BucketArns'].ParameterValue | [0]" --output text \
-  | tr ',' '\n' | sed -n 's#^arn:[a-z-]*:s3:::##p' | grep -E '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$' | xargs
+  | tr ',' '\n' | sed -n 's#^arn:[a-z-]*:s3:::##p' | { grep -E '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$' || true; } | xargs
 }
 
 # gpu_bucket_params "<bucket ...>" -> 两行 GpuS3BucketArns=... / GpuS3ObjectArns=... (模型 bucket 不重复列出)

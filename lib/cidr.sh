@@ -17,7 +17,7 @@ default_client_cidr() {
   fi
   local ip
   ip="$(curl -fsS --max-time 5 https://checkip.amazonaws.com 2>/dev/null | tr -d '[:space:]' || true)"
-  [[ -n "$ip" ]] && printf '%s/32' "$ip"
+  if [[ -n "$ip" ]]; then printf '%s/32' "$ip"; fi   # 用 if: 获取失败时也要返回 0 (调用方在 set -e 下赋值)
 }
 
 # normalize_cidrs <逗号分隔列表> <最大个数> <用途说明> -> stdout 去重后的逗号分隔列表

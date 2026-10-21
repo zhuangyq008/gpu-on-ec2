@@ -180,8 +180,9 @@ cmd_migrate-iam() {
       || die "读取节点栈 $NODE_STACK 的 S3BucketArns 失败，中止迁移"
     [[ -n "$old_arns" && "$old_arns" != "None" ]] || die "节点栈 $NODE_STACK 的 S3BucketArns 为空，中止迁移 (请人工确认原权限)"
     buckets="$(tr ',' '\n' <<<"$old_arns" | sed -n 's#^arn:[a-z-]*:s3:::##p' \
-      | grep -E '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$' | xargs)"
-    log "旧节点 Role 可访问: ${buckets:-无}"
+      | { grep -E '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$' || true; } | xargs)"
+    [[ -n "$buckets" ]] || die "节点栈 $NODE_STACK 的 S3BucketArns 中没有可识别的 bucket ($old_arns)，中止迁移 (请人工确认原权限)"
+    log "旧节点 Role 可访问: $buckets"
     ensure_gpu_buckets "$buckets"
   fi
 

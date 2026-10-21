@@ -25,7 +25,7 @@ bastion_sg_for_vpc() {
   local sg vpc
   sg="$(stack_output "$BASTION_STACK" BastionSecurityGroupId)"
   vpc="$(aws ec2 describe-security-groups --group-ids "$sg" --query 'SecurityGroups[0].VpcId' --output text 2>/dev/null || true)"
-  [[ "$vpc" == "$1" ]] && printf '%s' "$sg"
+  if [[ "$vpc" == "$1" ]]; then printf '%s' "$sg"; fi   # 用 if: 不同 VPC 时也要返回 0 (调用方在 set -e 下赋值)
 }
 
 # node_stack_params -> 每行一个 Key=Value
